@@ -10,6 +10,8 @@ mod confirm;
 mod mpi_wrap;
 mod vcfout;
 mod cluster;
+//mod generate_demo_data;
+mod merge_vcf;
 
 #[derive(Parser)]
 #[command(name = "svx", version, about = "Fast SNP/SV caller (Rust + MPI)")]

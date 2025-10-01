@@ -1,0 +1,4 @@
+chr22_demo_segment	0	500000
+chr22_demo_segment	500000	1000000
+chr22_demo_segment	1000000	1500000
+chr22_demo_segment	1500000	2000000
