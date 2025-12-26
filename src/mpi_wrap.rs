@@ -26,10 +26,7 @@ impl From<BinMsg> for bins::Bin {
     }
 }
 
-/// Simple MPI distribution for demo:
-/// - Root reads all bins
-/// - Each rank gets bins in round-robin
-/// - Each rank processes its bins
+/// Master-slave MPI distribution: master distributes, slaves process bins
 pub fn run_mpi(
     ref_fa: &str,
     bam: &str,
@@ -44,59 +41,54 @@ pub fn run_mpi(
     let rank = world.rank();
     let size = world.size();
 
-    // Root reads bins
-    let all_bins = if rank == 0 {
-        io_utils::read_bins(bins_path)?
-    } else {
-        Vec::new()
-    };
+    if size < 2 {
+        panic!("MPI run requires at least 2 ranks (1 master + 1 slave)");
+    }
 
-    // Assign bins
-    let bins_to_process: Vec<bins::Bin> = if rank == 0 {
-        let mut assignments = vec![Vec::new(); size as usize];
+    if rank == 0 {
+        // ---- MASTER ----
+        let all_bins = io_utils::read_bins(bins_path)?;
+
+        // distribute bins to slaves (ranks 1..size-1)
         for (i, b) in all_bins.into_iter().enumerate() {
-            let target = i % size as usize;
-            if target == 0 {
-                assignments[0].push(b);
-            } else {
-                let msg: BinMsg = b.into();
-                let encoded = bincode::serialize(&msg).unwrap();
-                world.process_at_rank(target as i32).send(&encoded[..]);
-            }
+            let target = 1 + (i % (size as usize - 1)) as i32;
+            let msg: BinMsg = b.into();
+            let encoded = bincode::serialize(&msg)?;
+            world.process_at_rank(target).send(&encoded[..]);
         }
 
-        // Send an empty Vec<u8> to signal "done"
+        // send "done" signal to all slaves
         for target in 1..size {
-            world.process_at_rank(target as i32).send(&[] as &[u8]);
+            world.process_at_rank(target).send(&[] as &[u8]);
         }
 
-        assignments[0].clone()
+        println!("Master finished distributing bins.");
+        world.barrier(); // wait for all slaves to finish
     } else {
-        let mut received = Vec::new();
+        // ---- SLAVES ----
+        let mut bins_to_process: Vec<bins::Bin> = Vec::new();
         loop {
             let (encoded, _status) = world.process_at_rank(0).receive_vec::<u8>();
-
             if encoded.is_empty() {
                 break; // end signal
             }
-
-            let msg: BinMsg = bincode::deserialize(&encoded).unwrap();
-            received.push(msg.into());
+            let msg: BinMsg = bincode::deserialize(&encoded)?;
+            bins_to_process.push(msg.into());
         }
-        received
-    };
 
-    println!("MPI rank {} started with {} bins", rank, bins_to_process.len());
+        println!("Rank {} received {} bins to process", rank, bins_to_process.len());
 
-    // Process bins
-    for b in bins_to_process {
-        println!("Rank {} processing bin {}:{}-{}", rank, b.chrom, b.start, b.end);
-        if let Err(e) = process_bin(ref_fa, bam, outdir, b, band, k, w) {
-            eprintln!("Error processing bin: {}", e);
+        // process all assigned bins
+        for b in bins_to_process {
+            println!("Rank {} processing bin {}:{}-{}", rank, b.chrom, b.start, b.end);
+            if let Err(e) = process_bin(ref_fa, bam, outdir, b, band, k, w) {
+                eprintln!("Error processing bin on rank {}: {}", rank, e);
+            }
         }
+
+        println!("Rank {} finished all assigned bins", rank);
+        world.barrier();
     }
 
-    println!("Rank {} finished all assigned bins", rank);
-    world.barrier();
     Ok(())
 }
