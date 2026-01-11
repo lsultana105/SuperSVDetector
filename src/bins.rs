@@ -4,7 +4,11 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Bin { pub chrom: String, pub start: u64, pub end: u64 }
+pub struct Bin {
+    pub chrom: String,
+    pub start: u64,
+    pub end: u64
+}
 
 pub fn build_bins<P: AsRef<Path> + std::fmt::Debug>(ref_fa: P, bin: usize, _pad: usize, out: &str) -> Result<()> {
     // Load the FASTA index (.fai)

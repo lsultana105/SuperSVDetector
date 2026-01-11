@@ -1,11 +1,9 @@
 use anyhow::Result;
 use bio::alignment::pairwise::{Aligner, Scoring};
 use bio::alignment::AlignmentOperation;
-use serde::{Serialize, Deserialize};
-
-use crate::bins::Bin;
-use crate::kmer::Hotspot;
 use crate::suffix::SuffixWorkspace;
+use crate::hotspot::Hotspot;
+use serde::{Serialize, Deserialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SvCall {
@@ -18,75 +16,46 @@ pub struct SvCall {
 }
 
 pub fn confirm_breakpoint(
-    bin: &Bin,
+    bin_start: u64,
+    chrom: &str,
     ref_window: &[u8],
-    sfx: &SuffixWorkspace,
+    _sfx: &SuffixWorkspace,
     hs: &Hotspot,
-    mut band: usize,
+    band: usize,
 ) -> Result<Option<SvCall>> {
     let center = hs.local_pos.min(ref_window.len().saturating_sub(1));
 
-    // --- Adjust band size depending on hotspot reason ---
-    if hs.reason.contains("discordant_large_insert") {
-        band = band.max(128); // allow bigger gaps for deletions
-    } else if hs.reason.contains("discordant_small_insert") {
-        band = band.max(64); // allow tighter gaps for small indels
-    } else if hs.reason.contains("discordant_orientation") {
-        band = band.max(96); // orientation anomalies may imply inversions
-    }
+    // REDUCE SEARCH SPACE: Only align a small local patch
+    let search_radius = band.max(200);
+    let ref_start = center.saturating_sub(search_radius);
+    let ref_end = (center + search_radius).min(ref_window.len());
 
-    // --- Banded alignment ---
-    let left = center.saturating_sub(band);
-    let right = (center + band).min(ref_window.len());
-    if right <= left + 20 {
-        return Ok(None);
-    }
-    let query = &ref_window[left..right];
+    if ref_end <= ref_start + 20 { return Ok(None); }
+
+    let local_ref = &ref_window[ref_start..ref_end];
+    let query_size = 100.min(local_ref.len() / 2); // Small probe
+    let query = &local_ref[local_ref.len()/2 - query_size/2 .. local_ref.len()/2 + query_size/2];
 
     let scoring = Scoring::new(-6, -1, |a: u8, b: u8| if a == b { 2 } else { -2 });
-    let mut aligner = Aligner::with_capacity_and_scoring(ref_window.len(), query.len(), scoring);
-    let aln = aligner.global(ref_window, query);
+    let mut aligner = Aligner::with_capacity_and_scoring(local_ref.len(), query.len(), scoring);
+    let aln = aligner.global(local_ref, query);
 
-    // --- Count longest insertion/deletion runs ---
-    let mut ins = 0isize;
-    let mut del = 0isize;
-    let mut cur_ins = 0isize;
-    let mut cur_del = 0isize;
+    let (mut ins, mut del, mut c_ins, mut c_del) = (0, 0, 0, 0);
     for op in aln.operations.iter() {
         match op {
-            AlignmentOperation::Ins => {
-                cur_ins += 1;
-                ins = ins.max(cur_ins);
-                cur_del = 0;
-            }
-            AlignmentOperation::Del => {
-                cur_del += 1;
-                del = del.max(cur_del);
-                cur_ins = 0;
-            }
-            _ => {
-                cur_ins = 0;
-                cur_del = 0;
-            }
+            AlignmentOperation::Ins => { c_ins += 1; ins = ins.max(c_ins); c_del = 0; }
+            AlignmentOperation::Del => { c_del += 1; del = del.max(c_del); c_ins = 0; }
+            _ => { c_ins = 0; c_del = 0; }
         }
     }
 
-    // --- Decide SV type ---
-    let (svtype, len) = if del >= 10 {
-        ("DEL".to_string(), -(del as isize))
-    } else if ins >= 10 {
-        ("INS".to_string(), (ins as isize))
-    } else {
-        return Ok(None);
-    };
+    let (svtype, len) = if del >= 10 { ("DEL".into(), -(del as isize)) }
+    else if ins >= 10 { ("INS".into(), ins as isize) }
+    else { return Ok(None); };
 
-    let pos = bin.start + center as u64 + 1;
     Ok(Some(SvCall {
-        chrom: bin.chrom.clone(),
-        pos,
-        svtype,
-        len,
-        score: aln.score,
-        reason: hs.reason.clone(), // keep hotspot reason for traceability
+        chrom: chrom.into(),
+        pos: bin_start + center as u64,
+        svtype, len, score: aln.score, reason: hs.reason.clone(),
     }))
 }

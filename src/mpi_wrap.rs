@@ -1,94 +1,64 @@
 use anyhow::Result;
 use mpi::traits::*;
 use serde::{Serialize, Deserialize};
-use bincode;
+use crate::{bins, process_bin, io_utils};
 
-use crate::{bins, process_bin};
-use crate::io_utils;
-
-/// Serializable version of Bin for MPI
 #[derive(Serialize, Deserialize)]
-struct BinMsg {
-    chrom: String,
-    start: u64,
-    end: u64,
-}
+struct BinMsg { chrom: String, start: u64, end: u64 }
 
 impl From<bins::Bin> for BinMsg {
-    fn from(b: bins::Bin) -> Self {
-        BinMsg { chrom: b.chrom, start: b.start, end: b.end }
-    }
+    fn from(b: bins::Bin) -> Self { BinMsg { chrom: b.chrom, start: b.start, end: b.end } }
 }
 
-impl From<BinMsg> for bins::Bin {
-    fn from(m: BinMsg) -> Self {
-        bins::Bin { chrom: m.chrom, start: m.start, end: m.end }
-    }
-}
-
-/// Master-slave MPI distribution: master distributes, slaves process bins
-pub fn run_mpi(
-    ref_fa: &str,
-    bam: &str,
-    bins_path: &str,
-    outdir: &str,
-    band: usize,
-    k: usize,
-    w: usize,
-) -> Result<()> {
+pub fn run_mpi(ref_fa: &str, bam: &str, bins_path: &str, outdir: &str, band: usize, k: usize, w: usize) -> Result<()> {
     let universe = mpi::initialize().expect("MPI init failed");
     let world = universe.world();
-    let rank = world.rank();
-    let size = world.size();
-
-    if size < 2 {
-        panic!("MPI run requires at least 2 ranks (1 master + 1 slave)");
-    }
+    let (rank, size) = (world.rank(), world.size());
 
     if rank == 0 {
-        // ---- MASTER ----
-        let all_bins = io_utils::read_bins(bins_path)?;
+        eprintln!("[MASTER] Initializing... Total Ranks: {}", size);
+        eprintln!("[MASTER] Attempting to read bins from: {}", bins_path);
 
-        // distribute bins to slaves (ranks 1..size-1)
-        for (i, b) in all_bins.into_iter().enumerate() {
-            let target = 1 + (i % (size as usize - 1)) as i32;
-            let msg: BinMsg = b.into();
-            let encoded = bincode::serialize(&msg)?;
-            world.process_at_rank(target).send(&encoded[..]);
+        let mut all_bins = io_utils::read_bins(bins_path)?;
+        eprintln!("[MASTER] Loaded {} bins. Starting distribution...", all_bins.len());
+
+        let mut finished_workers = 0;
+        while finished_workers < (size - 1) {
+            // Wait for a request
+            let (_, status) = world.any_process().receive_vec::<u8>();
+            let worker = status.source_rank();
+
+            if let Some(bin) = all_bins.pop() {
+                let msg = BinMsg::from(bin);
+                let encoded = bincode::serialize(&msg)?;
+                world.process_at_rank(worker).send(&encoded[..]);
+            } else {
+                eprintln!("[MASTER] No more bins. Sending shutdown to Rank {}", worker);
+                world.process_at_rank(worker).send(&[] as &[u8]);
+                finished_workers += 1;
+            }
         }
-
-        // send "done" signal to all slaves
-        for target in 1..size {
-            world.process_at_rank(target).send(&[] as &[u8]);
-        }
-
-        println!("Master finished distributing bins.");
-        world.barrier(); // wait for all slaves to finish
+        eprintln!("[MASTER] All tasks complete. Finalizing...");
     } else {
-        // ---- SLAVES ----
-        let mut bins_to_process: Vec<bins::Bin> = Vec::new();
+        eprintln!("[RANK {}] Worker online.", rank);
         loop {
-            let (encoded, _status) = world.process_at_rank(0).receive_vec::<u8>();
+            // Signal "Ready" to Master
+            world.process_at_rank(0).send(&[1u8] as &[u8]);
+
+            let (encoded, _) = world.process_at_rank(0).receive_vec::<u8>();
             if encoded.is_empty() {
-                break; // end signal
+                eprintln!("[RANK {}] Shutting down.", rank);
+                break;
             }
+
             let msg: BinMsg = bincode::deserialize(&encoded)?;
-            bins_to_process.push(msg.into());
-        }
+            let bin = bins::Bin { chrom: msg.chrom, start: msg.start, end: msg.end };
 
-        println!("Rank {} received {} bins to process", rank, bins_to_process.len());
-
-        // process all assigned bins
-        for b in bins_to_process {
-            println!("Rank {} processing bin {}:{}-{}", rank, b.chrom, b.start, b.end);
-            if let Err(e) = process_bin(ref_fa, bam, outdir, b, band, k, w) {
-                eprintln!("Error processing bin on rank {}: {}", rank, e);
+            eprintln!("[RANK {}] Working on {}:{}-{}", rank, bin.chrom, bin.start, bin.end);
+            if let Err(e) = crate::process_bin(ref_fa, bam, outdir, bin, band, k, w) {
+                eprintln!("[RANK {}] ERROR in process_bin: {}", rank, e);
             }
         }
-
-        println!("Rank {} finished all assigned bins", rank);
-        world.barrier();
     }
-
     Ok(())
 }
