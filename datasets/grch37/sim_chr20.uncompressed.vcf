@@ -1,8 +1,0 @@
-##fileformat=VCFv4.2
-##FILTER=<ID=PASS,Description="All filters passed">
-##source=svx
-##reference=datasets/grch37/GRCh37_chr20.fa
-##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
-##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Length of SV (negative for deletions)">
-##INFO=<ID=SCORE,Number=1,Type=Integer,Description="Alignment score or heuristic">
-#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO

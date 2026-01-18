@@ -69,7 +69,9 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
     }
 
     // Optional: cluster calls that are close together
-    let calls = cluster_calls(calls, 100);
+    let calls = cluster_calls(calls, 500);
+    // or
+    // let calls = cluster_calls(calls, 1000);
 
     // 2) Create VCF header
     let mut hdr = Header::new();

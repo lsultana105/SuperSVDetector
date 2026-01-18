@@ -19,6 +19,7 @@ use crate::kmer::{discover_hotspots, MinimizerIndex};
 use crate::hotspot::{Hotspot, hotspot_near_boundary};
 use crate::suffix::SuffixWorkspace;
 use crate::confirm::confirm_breakpoint;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -90,6 +91,8 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    let start = Instant::now();
+
     env_logger::init();
     let cli = Cli::parse();
 
@@ -117,25 +120,39 @@ fn main() -> Result<()> {
                     .ok();
             }
 
+            let insert_mean = io_utils::estimate_insert_mean(&bam).unwrap_or(0.0);
+            info!("Estimated insert-size mean: {:.2}", insert_mean);
+
             if mpi {
-                mpi_wrap::run_mpi(&ref_fa, &bam, &bins_path, &outdir, band, k, w)?;
+                mpi_wrap::run_mpi(
+                    &ref_fa,
+                    &bam,
+                    &bins_path,
+                    &outdir,
+                    band,
+                    k,
+                    w,
+                    insert_mean,
+                )?;
             } else {
                 let bins = io_utils::read_bins(&bins_path)?;
                 bins.into_par_iter().for_each(|bin| {
                     if let Err(e) =
-                        process_bin(&ref_fa, &bam, &outdir, bin, band, k, w)
+                        process_bin(&ref_fa, &bam, &outdir, bin, band, k, w, insert_mean)
                     {
                         error!("bin failed: {e}");
                     }
                 });
             }
         }
-
         Command::Merge { outdir, vcf, ref_fa } => {
             vcfout::merge_json_to_vcf(&outdir, &vcf, &ref_fa)?;
             info!("VCF written to {vcf}");
         }
     }
+    let duration = start.elapsed();
+    println!("--- Analysis Complete ---");
+    println!("Total Time Taken: {:?}", duration);
 
     Ok(())
 }
@@ -148,6 +165,7 @@ pub fn process_bin(
     band: usize,
     k: usize,
     w: usize,
+    insert_mean: f64,
 ) -> Result<()> {
     use crate::io_utils::*;
 
@@ -166,14 +184,32 @@ pub fn process_bin(
         hotspot_near_boundary(&hotspots[..], ref_window.len(), EDGE_MARGIN);
 
     let (final_ref_window, final_bin_start) = if needs_expansion {
-        let new_start = bin.start.saturating_sub(EDGE_MARGIN as u64);
-        let new_end = bin.end + EDGE_MARGIN as u64;
+        let mut new_start = bin.start.saturating_sub(EDGE_MARGIN as u64);
+        let mut new_end   = bin.end + EDGE_MARGIN as u64;
 
-        let extended = fetch_reference_window(ref_fa, &bin.chrom, new_start, new_end)?;
-
-        for hs in &mut hotspots {
-            hs.local_pos += (bin.start - new_start) as usize;
-        }
+        let extended = match fetch_reference_window(ref_fa, &bin.chrom, new_start, new_end) {
+            Ok(seq) => {
+                // Successfully extended: adjust hotspots if we moved the left boundary
+                if new_start < bin.start {
+                    let shift = (bin.start - new_start) as usize;
+                    for hs in &mut hotspots {
+                        hs.local_pos += shift;
+                    }
+                }
+                seq
+            }
+            Err(e) => {
+                // Likely went beyond contig end; fall back to original bin range
+                log::warn!(
+                "Extended fetch [{}, {}) for {} failed: {}. \
+                 Falling back to original bin [{}, {}).",
+                new_start, new_end, bin.chrom, e, bin.start, bin.end
+            );
+                new_start = bin.start;
+                new_end   = bin.end;
+                fetch_reference_window(ref_fa, &bin.chrom, new_start, new_end)?
+            }
+        };
 
         (extended, new_start)
     } else {
@@ -190,6 +226,8 @@ pub fn process_bin(
                 &sfx,
                 &hs,
                 band,
+                insert_mean,
+                &reads,
             )
                 .ok()
                 .flatten()
