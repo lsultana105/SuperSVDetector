@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rust_htslib::bam;
 use rust_htslib::bam::record::Cigar;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::hotspot::Hotspot;
 use crate::suffix::SuffixWorkspace;
@@ -9,7 +9,8 @@ use crate::suffix::SuffixWorkspace;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SvCall {
     pub chrom: String,
-    pub pos: u64,
+    pub pos: u64,     // VCF POS (1-based when written)
+    pub end: u64,     // VCF END (1-based conceptually; we store as 1-based coordinate)
     pub svtype: String,
     pub len: isize,
     pub score: i32,
@@ -18,13 +19,13 @@ pub struct SvCall {
 
 // median for u64
 fn median_u64(v: &mut Vec<u64>) -> u64 {
-    v.sort();
+    v.sort_unstable();
     v[v.len() / 2]
 }
 
 // median for isize
 fn median_isize(v: &mut Vec<isize>) -> isize {
-    v.sort();
+    v.sort_unstable();
     v[v.len() / 2]
 }
 
@@ -42,96 +43,141 @@ pub fn confirm_breakpoint(
     let local_start = center.saturating_sub(band);
     let local_end = (center + band).min(ref_window.len());
 
-    let g_start = bin_start + local_start as u64;
-    let g_end = bin_start + local_end as u64;
+    // NOTE: BAM positions are 0-based. VCF POS is 1-based.
+    let g_start0 = bin_start + local_start as u64; // 0-based
+    let g_end0 = bin_start + local_end as u64;     // 0-based end
 
     // Collect reads overlapping local window
     let mut support: Vec<&bam::Record> = Vec::new();
     for r in reads.iter() {
-        let pos = r.pos().max(0) as u64;
-        let end = pos + r.seq_len() as u64;
-        if end > g_start && pos < g_end {
+        let pos0 = r.pos().max(0) as u64;
+        let end0 = pos0 + r.seq_len() as u64;
+        if end0 > g_start0 && pos0 < g_end0 {
             support.push(r);
         }
     }
-
     if support.is_empty() {
         return Ok(None);
     }
 
-    // --- Deletions: strong TLEN deviations from discordant pairs ---
+    // -------------------------
+    // DEL: discordant pairs -> estimate start/end from anchors
+    // -------------------------
     if hs.reason == "discordant" {
-        const MIN_TLEN_DEV: f64 = 200.0;  // how much larger than mean to count
-        const MIN_DEL_LEN: f64 = 200.0;   // minimum deletion size to report
+        const MIN_TLEN_DEV: f64 = 200.0; // how much larger than mean
+        const MIN_DEL_BP: u64 = 50;      // don't emit micro events
 
-        let mut del_devs: Vec<f64> = Vec::new();
+        let mut left_bps: Vec<u64> = Vec::new();
+        let mut right_bps: Vec<u64> = Vec::new();
 
         for r in &support {
-            if r.is_paired() && !r.is_unmapped() && !r.is_mate_unmapped() && r.tid() == r.mtid() {
-                let tlen = r.insert_size().abs() as f64;
-                let dev = tlen - insert_mean;
-                if dev > MIN_TLEN_DEV {
-                    del_devs.push(dev);
-                }
+            if !(r.is_paired() && !r.is_unmapped() && !r.is_mate_unmapped()) {
+                continue;
+            }
+            if r.tid() != r.mtid() {
+                continue; // not handling BND here (yet)
+            }
+
+            let tlen = r.insert_size().abs() as f64;
+            if tlen - insert_mean <= MIN_TLEN_DEV {
+                continue;
+            }
+
+            // Anchor positions (0-based)
+            let rpos0 = r.pos().max(0) as u64;
+            let mpos0 = r.mpos().max(0) as u64;
+
+            let left0 = rpos0.min(mpos0);
+            let right0 = rpos0.max(mpos0);
+
+            // For deletions, breakpoint tends to be near end of left read and start of right read.
+            // Left breakpoint approx = left + read_len
+            let read_len = r.seq_len() as u64;
+            let left_bp0 = left0 + read_len;
+            let right_bp0 = right0;
+
+            if right_bp0 > left_bp0 {
+                left_bps.push(left_bp0);
+                right_bps.push(right_bp0);
             }
         }
 
-        if del_devs.is_empty() {
+        if left_bps.is_empty() || right_bps.is_empty() {
             return Ok(None);
         }
 
-        del_devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let del_est = del_devs[del_devs.len() / 2];
+        let start0 = median_u64(&mut left_bps);
+        let end0 = median_u64(&mut right_bps);
 
-        if del_est < MIN_DEL_LEN {
+        if end0 <= start0 || (end0 - start0) < MIN_DEL_BP {
             return Ok(None);
         }
+
+        let svlen = -((end0 - start0) as isize);
+
+        // Convert to VCF-style coordinates:
+        // - VCF POS is 1-based, so POS = start0 + 1
+        // - END is typically 1-based inclusive-ish in many callers; Lumpy uses END as coordinate.
+        // We'll store END as end0 (0-based) + 1.
+        let pos_vcf = start0 + 1;
+        let end_vcf = end0 + 1;
 
         return Ok(Some(SvCall {
             chrom: chrom.into(),
-            pos: bin_start + center as u64,
+            pos: pos_vcf,
+            end: end_vcf,
             svtype: "DEL".into(),
-            len: -(del_est.round() as isize),
-            score: support.len() as i32,
+            len: svlen,
+            score: (left_bps.len() as i32),
             reason: hs.reason.clone(),
         }));
     }
 
-    // --- Insertions: soft-clips + rare_kmer fallback ---
+    // -------------------------
+    // INS: soft clips -> estimate inserted length from clip size (approx)
+    // -------------------------
     if hs.reason == "soft_clip" {
         const MIN_SC_SUPPORT: usize = 2;
+        const MIN_CLIP: isize = 15;
 
         let mut clip_lens: Vec<isize> = Vec::new();
+        let mut clip_positions0: Vec<u64> = Vec::new();
 
         for r in &support {
+            let pos0 = r.pos().max(0) as u64;
             let cig = r.cigar();
+
             if let Some(Cigar::SoftClip(n)) = cig.iter().next() {
                 clip_lens.push(*n as isize);
+                clip_positions0.push(pos0);
             } else if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
                 clip_lens.push(*n as isize);
+                clip_positions0.push(pos0 + r.seq_len() as u64);
             }
         }
 
-        let approx_len = if !clip_lens.is_empty() {
-            median_isize(&mut clip_lens)
-        } else if hs.reason == "rare_kmer" {
-            // No explicit soft-clips but a strong rare_kmer hotspot.
-            // For synthetic data, we know insertions are ~50 bp.
-            50
-        } else {
-            return Ok(None);
-        };
-
-        if hs.reason == "soft_clip" && support.len() < MIN_SC_SUPPORT {
+        if clip_lens.len() < MIN_SC_SUPPORT {
             return Ok(None);
         }
 
+        let approx_len = median_isize(&mut clip_lens);
+        if approx_len < MIN_CLIP {
+            return Ok(None);
+        }
+
+        // choose a representative position near the clip cluster
+        let ins_pos0 = median_u64(&mut clip_positions0);
+
+        let pos_vcf = ins_pos0 + 1;
+        let end_vcf = pos_vcf; // INS: END often equals POS unless assembled
+
         return Ok(Some(SvCall {
             chrom: chrom.into(),
-            pos: bin_start + center as u64,
+            pos: pos_vcf,
+            end: end_vcf,
             svtype: "INS".into(),
             len: approx_len,
-            score: support.len() as i32,
+            score: clip_lens.len() as i32,
             reason: hs.reason.clone(),
         }));
     }
