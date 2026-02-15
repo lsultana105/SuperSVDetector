@@ -1,6 +1,5 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-
 use anyhow::{bail, Context, Result};
 use rust_htslib::bcf::{self, header::Header, Writer};
 use serde_json::Deserializer;
@@ -76,30 +75,24 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
         }
     }
 
-    // Cluster nearby calls (tune as needed)
+    // Cluster nearby calls (you can tune radius later)
     let calls = cluster_calls(calls, 500);
 
     // 2) Header
     let mut hdr = Header::new();
     hdr.push_record(b"##fileformat=VCFv4.2");
-    hdr.push_record(b"##source=svx");
+    hdr.push_record(b"##source=SuperSVDetector");
     hdr.push_record(format!("##reference={}", ref_fa).as_bytes());
 
-    hdr.push_record(
-        b"##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">",
-    );
-    hdr.push_record(
-        b"##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length of SV (negative for deletions)\">",
-    );
-    hdr.push_record(
-        b"##INFO=<ID=END,Number=1,Type=Integer,Description=\"End coordinate of the variant\">",
-    );
-    hdr.push_record(
-        b"##INFO=<ID=SCORE,Number=1,Type=Integer,Description=\"Support/heuristic score\">",
-    );
-    hdr.push_record(
-        b"##INFO=<ID=REASON,Number=1,Type=String,Description=\"Hotspot reason\">",
-    );
+    hdr.push_record(b"##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">");
+    hdr.push_record(b"##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length of SV (negative for deletions)\">");
+    hdr.push_record(b"##INFO=<ID=END,Number=1,Type=Integer,Description=\"End coordinate of the variant\">");
+    hdr.push_record(b"##INFO=<ID=SCORE,Number=1,Type=Integer,Description=\"Support/heuristic score\">");
+    hdr.push_record(b"##INFO=<ID=REASON,Number=1,Type=String,Description=\"Evidence source\">");
+
+    // for BND debug/analysis
+    hdr.push_record(b"##INFO=<ID=MATECHR,Number=1,Type=String,Description=\"Mate chromosome for BND\">");
+    hdr.push_record(b"##INFO=<ID=MATEPOS,Number=1,Type=Integer,Description=\"Mate position (1-based) for BND\">");
 
     add_contigs_from_fai(&mut hdr, ref_fa)?;
     hdr.push_record(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO");
@@ -124,21 +117,33 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
         let mut rec = w.empty_record();
         rec.set_rid(Some(rid));
 
-        // c.pos is already 1-based in SvCall, but bcf expects 0-based.
+        // c.pos is 1-based in SvCall, but bcf expects 0-based.
         rec.set_pos((c.pos.saturating_sub(1)) as i64);
 
         rec.set_id(format!("svx_{}", i).as_bytes())?;
         rec.set_qual(0.0);
 
-        let alt = format!("<{}>", c.svtype);
-        let alleles = [b"N".as_ref(), alt.as_bytes()];
+        // ALT formatting
+        // - DEL/INS: symbolic
+        // - BND: minimal breakend string
+        let alt_string = if c.svtype == "BND" {
+            if let (Some(mchr), Some(mpos)) = (&c.mate_chrom, c.mate_pos) {
+                // minimal: N[chr:pos[
+                format!("N[{}:{}[", mchr, mpos)
+            } else {
+                "<BND>".to_string()
+            }
+        } else {
+            format!("<{}>", c.svtype)
+        };
+
+        let alleles = [b"N".as_ref(), alt_string.as_bytes()];
         rec.set_alleles(&alleles)?;
 
         // INFO
         rec.push_info_string(b"SVTYPE", &[c.svtype.as_bytes()])?;
         rec.push_info_integer(b"SVLEN", &[c.len as i32])?;
 
-        // END must be int; human contigs fit in i32, but guard just in case
         if c.end > i32::MAX as u64 {
             eprintln!("Warning: END too large for i32 ({}), skipping", c.end);
             continue;
@@ -148,6 +153,15 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
         rec.push_info_integer(b"SCORE", &[c.score])?;
         rec.push_info_string(b"REASON", &[c.reason.as_bytes()])?;
 
+        if let Some(mchr) = &c.mate_chrom {
+            rec.push_info_string(b"MATECHR", &[mchr.as_bytes()])?;
+        }
+        if let Some(mpos) = c.mate_pos {
+            if mpos <= i32::MAX as u64 {
+                rec.push_info_integer(b"MATEPOS", &[mpos as i32])?;
+            }
+        }
+
         w.write(&rec)?;
         written += 1;
     }
@@ -156,5 +170,6 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
         "Merged {} JSON file(s), wrote {} record(s) to {}",
         n_json, written, vcf_path
     );
+
     Ok(())
 }

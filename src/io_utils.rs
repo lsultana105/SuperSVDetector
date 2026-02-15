@@ -7,6 +7,13 @@ use bio::io::fasta;
 
 use crate::bins::Bin;
 
+pub fn tid_to_name(reader: &bam::IndexedReader, tid: i32) -> Option<String> {
+    if tid < 0 { return None; }
+    let hdr = reader.header().to_owned();
+    let bytes: &[u8] = hdr.tid2name(tid as u32);
+    Some(String::from_utf8_lossy(bytes).to_string())
+}
+
 /// Fetch a reference subsequence [start, end) for a given chromosome.
 pub fn fetch_reference_window<P: AsRef<Path> + std::fmt::Debug>(
     ref_fa: P,
@@ -71,33 +78,67 @@ pub fn read_bins(bins_path: &str) -> Result<Vec<Bin>> {
     Ok(out)
 }
 
-/// Estimate the mean insert size (TLEN) for proper pairs in a BAM.
-/// Used to approximate deletion sizes from discordant pairs.
-pub fn estimate_insert_mean(bam_path: &str) -> Result<f64> {
+
+/// Estimate insert size mean and standard deviation (TLEN) for proper pairs.
+/// Filters extreme TLENs to avoid insane values.
+///
+/// Returns (mean, sd). If insufficient data, returns (0.0, 0.0).
+pub fn estimate_insert_stats(bam_path: &str) -> Result<(f64, f64)> {
     let mut reader = bam::Reader::from_path(bam_path)?;
-    let mut total = 0f64;
-    let mut count = 0usize;
+
+    let mut vals: Vec<f64> = Vec::new();
+    vals.reserve(200_000);
 
     for rec in reader.records() {
         let r = rec?;
+
+        // keep only clean-ish proper pairs
         if !r.is_paired() || r.is_unmapped() || r.is_mate_unmapped() {
+            continue;
+        }
+        if r.is_secondary() || r.is_duplicate() {
             continue;
         }
         if r.tid() != r.mtid() {
             continue;
         }
+        if !r.is_proper_pair() {
+            continue;
+        }
 
         let tlen = r.insert_size().abs() as f64;
-        // Filter obviously crazy values; your synthetic lib has ~450 bp
-        if tlen > 0.0 && tlen < 2000.0 {
-            total += tlen;
-            count += 1;
+
+        // Keep plausible values (tune if needed)
+        if tlen <= 0.0 || tlen > 2000.0 {
+            continue;
+        }
+
+        vals.push(tlen);
+
+        // cap sample size for speed (optional)
+        if vals.len() >= 200_000 {
+            break;
         }
     }
 
-    if count == 0 {
-        return Ok(0.0);
+    if vals.len() < 2000 {
+        return Ok((0.0, 0.0));
     }
 
-    Ok(total / (count as f64))
+    let n = vals.len() as f64;
+    let mean = vals.iter().sum::<f64>() / n;
+
+    let var = vals
+        .iter()
+        .map(|x| {
+            let d = x - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / (n - 1.0);
+
+    let sd = var.sqrt();
+
+    Ok((mean, sd))
 }
+

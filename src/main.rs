@@ -21,6 +21,11 @@ use crate::suffix::SuffixWorkspace;
 use crate::confirm::confirm_breakpoint;
 use std::time::Instant;
 
+use crate::io_utils::fetch_reference_window;
+use crate::io_utils::open_bam;
+use crate::io_utils::fetch_reads_overlapping;
+use rust_htslib::bam::Read;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "SuperSVDetector",
@@ -120,8 +125,17 @@ fn main() -> Result<()> {
                     .ok();
             }
 
-            let insert_mean = io_utils::estimate_insert_mean(&bam).unwrap_or(0.0);
-            info!("Estimated insert-size mean: {:.2}", insert_mean);
+            let (insert_mean, insert_sd) = io_utils::estimate_insert_stats(&bam).unwrap_or((0.0, 0.0));
+            info!("Insert stats mean={:.2} sd={:.2}", insert_mean, insert_sd);
+
+            let mut reader = rust_htslib::bam::IndexedReader::from_path(&bam)?;
+            let header = reader.header().to_owned();
+
+            let mut tid_names: Vec<String> = Vec::new();
+            for tid in 0..header.target_count() {
+                let name = String::from_utf8_lossy(header.tid2name(tid)).to_string();
+                tid_names.push(name);
+            }
 
             if mpi {
                 mpi_wrap::run_mpi(
@@ -133,12 +147,23 @@ fn main() -> Result<()> {
                     k,
                     w,
                     insert_mean,
+                    insert_sd,
+                    &tid_names,
                 )?;
             } else {
+                let mut reader = rust_htslib::bam::IndexedReader::from_path(&bam)?;
+                let header = reader.header().to_owned();
+
+                let mut tid_names: Vec<String> = Vec::new();
+                for tid in 0..header.target_count() {
+                    let name = String::from_utf8_lossy(header.tid2name(tid)).to_string();
+                    tid_names.push(name);
+                }
+
                 let bins = io_utils::read_bins(&bins_path)?;
                 bins.into_par_iter().for_each(|bin| {
                     if let Err(e) =
-                        process_bin(&ref_fa, &bam, &outdir, bin, band, k, w, insert_mean)
+                        process_bin(&ref_fa, &bam, &outdir, bin, band, k, w, insert_mean, insert_sd, &tid_names,)
                     {
                         error!("bin failed: {e}");
                     }
@@ -161,11 +186,13 @@ pub fn process_bin(
     ref_fa: &str,
     bam_path: &str,
     outdir: &str,
-    mut bin: Bin,
+    bin: Bin,
     band: usize,
     k: usize,
     w: usize,
     insert_mean: f64,
+    insert_sd: f64,
+    tid_names: &[String],
 ) -> Result<()> {
     use crate::io_utils::*;
 
@@ -178,18 +205,16 @@ pub fn process_bin(
     let reads = fetch_reads_overlapping(&mut reader, &bin.chrom, bin.start, bin.end)?;
 
     let mindex = MinimizerIndex::build(&ref_window, k, w);
-    let mut hotspots = discover_hotspots(&reads, &mindex, k);
+    let mut hotspots = discover_hotspots(&reads, &mindex, k, bin.start, insert_mean, insert_sd);
 
-    let needs_expansion =
-        hotspot_near_boundary(&hotspots[..], ref_window.len(), EDGE_MARGIN);
+    let needs_expansion = hotspot_near_boundary(&hotspots[..], ref_window.len(), EDGE_MARGIN);
 
     let (final_ref_window, final_bin_start) = if needs_expansion {
         let mut new_start = bin.start.saturating_sub(EDGE_MARGIN as u64);
-        let mut new_end   = bin.end + EDGE_MARGIN as u64;
+        let mut new_end = bin.end + EDGE_MARGIN as u64;
 
         let extended = match fetch_reference_window(ref_fa, &bin.chrom, new_start, new_end) {
             Ok(seq) => {
-                // Successfully extended: adjust hotspots if we moved the left boundary
                 if new_start < bin.start {
                     let shift = (bin.start - new_start) as usize;
                     for hs in &mut hotspots {
@@ -199,14 +224,12 @@ pub fn process_bin(
                 seq
             }
             Err(e) => {
-                // Likely went beyond contig end; fall back to original bin range
                 log::warn!(
-                "Extended fetch [{}, {}) for {} failed: {}. \
-                 Falling back to original bin [{}, {}).",
-                new_start, new_end, bin.chrom, e, bin.start, bin.end
-            );
+                    "Extended fetch [{}, {}) for {} failed: {}. Falling back to original bin [{}, {}).",
+                    new_start, new_end, bin.chrom, e, bin.start, bin.end
+                );
                 new_start = bin.start;
-                new_end   = bin.end;
+                new_end = bin.end;
                 fetch_reference_window(ref_fa, &bin.chrom, new_start, new_end)?
             }
         };
@@ -227,7 +250,10 @@ pub fn process_bin(
                 &hs,
                 band,
                 insert_mean,
+                insert_sd,
                 &reads,
+                k,
+                tid_names,
             )
                 .ok()
                 .flatten()
@@ -237,4 +263,3 @@ pub fn process_bin(
     vcfout::write_bin_json(outdir, &bin, &calls)?;
     Ok(())
 }
-

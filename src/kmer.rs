@@ -54,80 +54,120 @@ impl MinimizerIndex {
     }
 }
 
-/// Evidence counts per binned region (so we don't lose mixed evidence types).
 #[derive(Default, Clone, Debug)]
 struct EvidenceCounts {
-    discordant: usize,
-    soft_clip: usize,
+    discordant_del: usize,
+    bnd_pe: usize,
+    soft_clip_sr: usize,
     rare_kmer: usize,
 }
 
-/// Find candidate breakpoint "hotspots" inside a bin.
-/// - discordant pairs → DEL candidates
-/// - soft clips → INS / breakpoint candidates
-/// - rare kmers → optional fallback (currently disabled by threshold)
-pub fn discover_hotspots(reads: &[bam::Record], mindex: &MinimizerIndex, k: usize) -> Vec<Hotspot> {
-    let mut evidence_map: HashMap<usize, EvidenceCounts> = HashMap::new();
+pub fn discover_hotspots(
+    reads: &[bam::Record],
+    mindex: &MinimizerIndex,
+    k: usize,
+    bin_start: u64,
+    insert_mean: f64,
+    insert_sd: f64,
+) -> Vec<Hotspot> {
+    let mut evidence: HashMap<usize, EvidenceCounts> = HashMap::new();
 
-    // Per-evidence thresholds
-    const MIN_RP_SUPPORT: usize = 2;        // discordant pairs: allow low support (important!)
-    const MIN_SC_SUPPORT: usize = 1;        // soft-clips: even 1 is informative in synthetic tests
-    const MIN_RARE_SUPPORT: usize = 9999;   // keep disabled for now
+    // ---------- tuning knobs (aiming closer to Lumpy) ----------
+    const MIN_MAPQ: u8 = 20;
 
-    // Window sizes by evidence type
-    const WIN_DISCORDANT: usize = 500; // key fix: avoids splitting evidence across too many 100bp bins
-    const WIN_SOFTCLIP: usize = 100;
+    // Lumpy-ish discordant filter (discordant_z≈5)
+    const Z_CUTOFF: f64 = 5.0;
+
+    // Hotspot support thresholds (raise/lower as needed)
+    const MIN_DEL_PE_SUPPORT: usize = 6;
+    const MIN_BND_SUPPORT: usize = 3;
+
+    // IMPORTANT: SR evidence must be stronger than “any soft clip”
+    const MIN_SR_SUPPORT: usize = 4;
+
+    // window sizes
+    const WIN_DISCORDANT: usize = 500;
+    const WIN_BND: usize = 500;
+    const WIN_SR: usize = 100;
     const WIN_RARE: usize = 200;
 
-    println!("--- Starting Hotspot Discovery ---");
-    println!("Total reads to process: {}", reads.len());
+    // Rare kmers disabled
+    const MIN_RARE_SUPPORT: usize = 999999;
+
+    let min_clip = (k as u32).max(20);
 
     for r in reads {
-        // keep it simple for now; for real data you may also want r.is_supplementary()
         if r.is_secondary() || r.is_duplicate() {
             continue;
         }
+        if r.mapq() < MIN_MAPQ {
+            continue;
+        }
 
-        let pos = r.pos().max(0) as usize;
+        let gpos0 = r.pos().max(0) as u64;
+        if gpos0 < bin_start {
+            continue;
+        }
+        let local = (gpos0 - bin_start) as usize;
 
-        // 1) Discordant pairs (DEL signal)
+        // ---------------------------
+        // 1) PE evidence
+        // ---------------------------
         if r.is_paired() && !r.is_unmapped() && !r.is_mate_unmapped() {
-            let isize = r.insert_size().abs() as usize;
+            // inter-chrom = BND-ish signal
+            if r.tid() != r.mtid() {
+                // count one per pair
+                if r.pos() < r.mpos() {
+                    let b = (local / WIN_BND) * WIN_BND;
+                    evidence.entry(b).or_default().bnd_pe += 1;
+                }
+                continue;
+            }
 
-            // this condition matches your original intention: abnormal TLEN or weird orientation
-            if isize > 1000 || isize < 100 || r.is_reverse() == r.is_mate_reverse() {
-                let bin = (pos / WIN_DISCORDANT) * WIN_DISCORDANT;
-                evidence_map.entry(bin).or_default().discordant += 1;
-                continue; // avoid counting same read as soft-clip/rare-kmer too
+            // same chrom: discordant DEL-like
+            if !r.is_proper_pair() && insert_sd > 0.0 && r.pos() < r.mpos() {
+                let tlen = r.insert_size().abs() as f64;
+                let z = (tlen - insert_mean) / insert_sd;
+                if z >= Z_CUTOFF {
+                    let b = (local / WIN_DISCORDANT) * WIN_DISCORDANT;
+                    evidence.entry(b).or_default().discordant_del += 1;
+                    continue;
+                }
             }
         }
 
-        // 2) Soft clips (INS / breakpoint signal)
-        {
-            let cigar = r.cigar();
-            let mut sc_ok = false;
+        // ---------------------------
+        // 2) SR-like evidence (soft-clip but only if split-ish)
+        //    Lumpy uses splitters BAM. Approximate that by requiring:
+        //      - supplementary OR SA tag present
+        //      - and a sufficiently long soft clip
+        // ---------------------------
+        let has_sa = r.aux(b"SA").is_ok();
+        let is_split_like = has_sa || r.is_supplementary();
 
-            if let Some(Cigar::SoftClip(n)) = cigar.iter().next() {
-                if *n as usize >= k {
-                    sc_ok = true;
+        if is_split_like {
+            let cig = r.cigar();
+            let mut ok = false;
+
+            if let Some(Cigar::SoftClip(n)) = cig.iter().next() {
+                if *n >= min_clip { ok = true; }
+            }
+            if !ok {
+                if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
+                    if *n >= min_clip { ok = true; }
                 }
             }
-            if !sc_ok {
-                if let Some(Cigar::SoftClip(n)) = cigar.iter().last() {
-                    if *n as usize >= k {
-                        sc_ok = true;
-                    }
-                }
-            }
 
-            if sc_ok {
-                let bin = (pos / WIN_SOFTCLIP) * WIN_SOFTCLIP;
-                evidence_map.entry(bin).or_default().soft_clip += 1;
+            if ok {
+                let b = (local / WIN_SR) * WIN_SR;
+                evidence.entry(b).or_default().soft_clip_sr += 1;
                 continue;
             }
         }
 
-        // 3) Rare kmers (disabled by threshold but left here for later)
+        // ---------------------------
+        // 3) Rare kmers (disabled)
+        // ---------------------------
         if r.seq_len() >= k {
             let seq = r.seq();
             let (mut rare, mut total) = (0usize, 0usize);
@@ -142,39 +182,35 @@ pub fn discover_hotspots(reads: &[bam::Record], mindex: &MinimizerIndex, k: usiz
             }
 
             if total >= 5 && rare * 2 > total {
-                let bin = (pos / WIN_RARE) * WIN_RARE;
-                evidence_map.entry(bin).or_default().rare_kmer += 1;
+                let b = (local / WIN_RARE) * WIN_RARE;
+                evidence.entry(b).or_default().rare_kmer += 1;
             }
         }
     }
 
-    println!("Candidate sites found before filtering: {}", evidence_map.len());
-
-    // Emit hotspots per evidence type (one region can produce multiple hotspot types)
-    let mut final_hs: Vec<Hotspot> = Vec::new();
-
-    for (bin, c) in evidence_map.into_iter() {
-        if c.discordant >= MIN_RP_SUPPORT {
-            final_hs.push(Hotspot { local_pos: bin, reason: "discordant".into() });
+    let mut out: Vec<Hotspot> = Vec::new();
+    for (bin, c) in evidence.into_iter() {
+        if c.discordant_del >= MIN_DEL_PE_SUPPORT {
+            out.push(Hotspot { local_pos: bin, reason: "discordant_del".into() });
         }
-        if c.soft_clip >= MIN_SC_SUPPORT {
-            final_hs.push(Hotspot { local_pos: bin, reason: "soft_clip".into() });
+        if c.bnd_pe >= MIN_BND_SUPPORT {
+            out.push(Hotspot { local_pos: bin, reason: "bnd_pe".into() });
+        }
+        if c.soft_clip_sr >= MIN_SR_SUPPORT {
+            out.push(Hotspot { local_pos: bin, reason: "soft_clip_sr".into() });
         }
         if c.rare_kmer >= MIN_RARE_SUPPORT {
-            final_hs.push(Hotspot { local_pos: bin, reason: "rare_kmer".into() });
+            out.push(Hotspot { local_pos: bin, reason: "rare_kmer".into() });
         }
     }
 
-    println!("Final High-Confidence Hotspots: {}", final_hs.len());
-
-    final_hs.sort_by_key(|h| h.local_pos);
-    final_hs
+    out.sort_by_key(|h| h.local_pos);
+    out
 }
 
 fn encode_kmer(seq: &Seq, i: usize, k: usize) -> Option<u64> {
     let mut val = 0u64;
     let bytes = seq.as_bytes();
-
     for t in 0..k {
         val = (val << 2)
             | match bytes[i + t] {
@@ -185,6 +221,5 @@ fn encode_kmer(seq: &Seq, i: usize, k: usize) -> Option<u64> {
             _ => return None,
         };
     }
-
     Some(val)
 }

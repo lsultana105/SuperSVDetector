@@ -77,8 +77,16 @@ fn main() -> Result<()> {
         rec.set_id(format!("svx_{}", i).as_bytes())?;
         rec.set_qual(0.0);
 
-        let alt = format!("<{}>", c.svtype);
-        let alleles = [b"N".as_ref(), alt.as_bytes()];
+        let alt_str = if c.svtype == "BND" {
+            // Minimal valid breakend ALT. Not modeling orientation; this is still valid VCF.
+            let mch = c.mate_chrom.as_deref().unwrap_or("UNKNOWN");
+            let mpos = c.mate_pos.unwrap_or(c.pos);
+            format!("N]{}:{}]", mch, mpos)
+        } else {
+            format!("<{}>", c.svtype)
+        };
+
+        let alleles = [b"N".as_ref(), alt_str.as_bytes()];
         rec.set_alleles(&alleles)?;
 
         rec.push_info_string(b"SVTYPE", &[c.svtype.as_bytes()])?;
