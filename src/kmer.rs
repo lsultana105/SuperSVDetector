@@ -94,7 +94,7 @@ pub fn discover_hotspots(
     // Rare kmers disabled
     const MIN_RARE_SUPPORT: usize = 999999;
 
-    let min_clip = (k as u32).max(20);
+    let min_clip_sr: u32 = 12;
 
     for r in reads {
         if r.is_secondary() || r.is_duplicate() {
@@ -125,7 +125,8 @@ pub fn discover_hotspots(
             }
 
             // same chrom: discordant DEL-like
-            if !r.is_proper_pair() && insert_sd > 0.0 && r.pos() < r.mpos() {
+            // same chrom: discordant DEL-like (do NOT require improper-pair flag)
+            if insert_sd > 0.0 && r.pos() < r.mpos() {
                 let tlen = r.insert_size().abs() as f64;
                 let z = (tlen - insert_mean) / insert_sd;
                 if z >= Z_CUTOFF {
@@ -150,11 +151,11 @@ pub fn discover_hotspots(
             let mut ok = false;
 
             if let Some(Cigar::SoftClip(n)) = cig.iter().next() {
-                if *n >= min_clip { ok = true; }
+                if *n >= min_clip_sr { ok = true; }
             }
             if !ok {
                 if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
-                    if *n >= min_clip { ok = true; }
+                    if *n >= min_clip_sr { ok = true; }
                 }
             }
 
