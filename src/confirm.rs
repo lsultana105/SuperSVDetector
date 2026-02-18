@@ -22,15 +22,218 @@ pub struct SvCall {
     pub mate_pos: Option<u64>,
 }
 
-// median for u64
+// ------------------------
+// small utilities
+// ------------------------
+
 fn median_u64(v: &mut Vec<u64>) -> u64 {
     v.sort_unstable();
     v[v.len() / 2]
 }
+
 fn median_isize(v: &mut Vec<isize>) -> isize {
     v.sort_unstable();
     v[v.len() / 2]
 }
+
+fn ref_consumed_len(cig: &bam::record::CigarStringView) -> u64 {
+    use bam::record::Cigar::*;
+    cig.iter()
+        .map(|c| match c {
+            Match(n) | Diff(n) | Equal(n) | Del(n) | RefSkip(n) => *n as u64,
+            Ins(_) | SoftClip(_) | HardClip(_) | Pad(_) => 0,
+        })
+        .sum()
+}
+
+/// Spread after trimming extremes (trim_frac on each side).
+/// If n is small, returns 0 (i.e. don't over-penalize small samples).
+fn trimmed_spread(sorted: &[u64], trim_frac: f64) -> u64 {
+    let n = sorted.len();
+    if n < 5 {
+        return 0;
+    }
+    let lo = (n as f64 * trim_frac).floor() as usize;
+    let mut hi = (n as f64 * (1.0 - trim_frac)).ceil() as usize;
+    if hi >= n {
+        hi = n - 1;
+    }
+    if hi <= lo {
+        return 0;
+    }
+    sorted[hi] - sorted[lo]
+}
+
+// ------------------------
+// PE deletion confirmer (the “good” one)
+// ------------------------
+
+fn confirm_pe_deletion_from_support(
+    support: &[&bam::Record],
+    insert_mean: f64,
+    insert_sd: f64,
+) -> Option<(u64, u64, usize)> {
+    use std::collections::HashSet;
+
+    // Tunables
+    const MIN_MAPQ: u8 = 20;
+    const MIN_DEL_BP: u64 = 50;
+
+    // keep this at 4 for TBX sensitivity (you already moved toward this)
+    const MIN_PE_SUPPORT: usize = 4;
+
+    // keep these aligned with discover_hotspots (you already did Z=3 there in TBX debug)
+    const Z_CUTOFF: f64 = 3.0;
+
+    const MAX_DEL_SPAN: u64 = 50_000;
+
+    // robust gates
+    const MAX_BP_SPREAD: u64 = 1500;
+    const TRIM_FRAC: f64 = 0.10;
+
+    // NEW: breakpoint clustering window (handles bimodal mate starts)
+    const CLUSTER_WIN_BP: u64 = 800;
+
+    if insert_sd <= 0.0 {
+        return None;
+    }
+
+    // Two-pointer densest window on sorted positions (returns [lo, hi) indices)
+    fn densest_window(sorted: &[u64], width: u64) -> (usize, usize) {
+        if sorted.is_empty() {
+            return (0, 0);
+        }
+        let mut best_lo = 0usize;
+        let mut best_hi = 1usize;
+
+        let mut lo = 0usize;
+        for hi in 0..sorted.len() {
+            while sorted[hi].saturating_sub(sorted[lo]) > width {
+                lo += 1;
+            }
+            if (hi + 1) - lo > best_hi - best_lo {
+                best_lo = lo;
+                best_hi = hi + 1;
+            }
+        }
+        (best_lo, best_hi)
+    }
+
+    let hard_tlen_min: f64 = (insert_mean + 3.0 * insert_sd).max(800.0);
+
+    let mut left_bps: Vec<u64> = Vec::new();
+    let mut right_bps: Vec<u64> = Vec::new();
+    let mut seen_qname: HashSet<Vec<u8>> = HashSet::new();
+
+    for r in support {
+        if r.is_secondary() || r.is_duplicate() {
+            continue;
+        }
+        if r.mapq() < MIN_MAPQ {
+            continue;
+        }
+        if !(r.is_paired() && !r.is_unmapped() && !r.is_mate_unmapped()) {
+            continue;
+        }
+        if r.tid() != r.mtid() {
+            continue;
+        }
+
+        // discordant test consistent with discover_hotspots: z-pass OR hard cutoff
+        let tlen = r.insert_size().abs() as f64;
+        let mut discordant = false;
+
+        let z = (tlen - insert_mean) / insert_sd;
+        if z >= Z_CUTOFF {
+            discordant = true;
+        }
+        if tlen >= hard_tlen_min {
+            discordant = true;
+        }
+        if !discordant {
+            continue;
+        }
+
+        // orientation filter (same as you used before)
+        let rev = r.is_reverse();
+        let mrev = r.is_mate_reverse();
+        if rev == mrev {
+            continue;
+        }
+
+        // unique fragment by qname
+        let qn = r.qname().to_vec();
+        if !seen_qname.insert(qn) {
+            continue;
+        }
+
+        let rpos0 = r.pos().max(0) as u64;
+        let mpos0 = r.mpos().max(0) as u64;
+
+        // only use the left read in the pair
+        if rpos0 > mpos0 {
+            continue;
+        }
+
+        let left_bp0 = rpos0 + ref_consumed_len(&r.cigar()); // end of left read
+        let right_bp0 = mpos0; // start of right read
+
+        if right_bp0 <= left_bp0 {
+            continue;
+        }
+        if (right_bp0 - left_bp0) > MAX_DEL_SPAN {
+            continue;
+        }
+
+        left_bps.push(left_bp0);
+        right_bps.push(right_bp0);
+    }
+
+    if left_bps.len() < MIN_PE_SUPPORT || right_bps.len() < MIN_PE_SUPPORT {
+        return None;
+    }
+
+    left_bps.sort_unstable();
+    right_bps.sort_unstable();
+
+    // NEW: pick densest cluster to kill bimodality (TBX problem)
+    let (l_lo, l_hi) = densest_window(&left_bps, CLUSTER_WIN_BP);
+    let (r_lo, r_hi) = densest_window(&right_bps, CLUSTER_WIN_BP);
+
+    let mut left_c = left_bps[l_lo..l_hi].to_vec();
+    let mut right_c = right_bps[r_lo..r_hi].to_vec();
+
+    if left_c.len() < MIN_PE_SUPPORT || right_c.len() < MIN_PE_SUPPORT {
+        return None;
+    }
+
+    left_c.sort_unstable();
+    right_c.sort_unstable();
+
+    // robust spread gate (trimmed)
+    let left_spread = trimmed_spread(&left_c, TRIM_FRAC);
+    let right_spread = trimmed_spread(&right_c, TRIM_FRAC);
+    if left_spread > MAX_BP_SPREAD || right_spread > MAX_BP_SPREAD {
+        return None;
+    }
+
+    let start0 = median_u64(&mut left_c);
+    let end0 = median_u64(&mut right_c);
+
+    if end0 <= start0 || (end0 - start0) < MIN_DEL_BP {
+        return None;
+    }
+
+    // score = cluster support used (min of both sides)
+    let score = left_c.len().min(right_c.len());
+    Some((start0, end0, score))
+}
+
+
+
+// ------------------------
+// main entry point
+// ------------------------
 
 pub fn confirm_breakpoint(
     bin_start: u64,
@@ -43,9 +246,9 @@ pub fn confirm_breakpoint(
     insert_sd: f64,
     reads: &[bam::Record],
     k: usize,
-    tid_names: &[String], // tid -> chrom name
+    tid_names: &[String],
 ) -> Result<Option<SvCall>> {
-    // Hotspot local -> global window
+    // Window around hotspot (global coords)
     let center = hs.local_pos;
     let local_start = center.saturating_sub(band);
     let local_end = center + band;
@@ -53,186 +256,53 @@ pub fn confirm_breakpoint(
     let g_start0 = bin_start + local_start as u64;
     let g_end0 = bin_start + local_end as u64;
 
-    // Gather overlapping reads
+    // Gather overlapping reads (or mate overlaps) into support
     let mut support: Vec<&bam::Record> = Vec::new();
     for r in reads.iter() {
         let pos0 = r.pos().max(0) as u64;
-        let end0 = pos0 + r.seq_len() as u64; // coarse gate
-        if end0 > g_start0 && pos0 < g_end0 {
+        let end0 = pos0 + ref_consumed_len(&r.cigar());
+
+        let read_overlaps = end0 > g_start0 && pos0 < g_end0;
+
+        let mate_overlaps = r.is_paired()
+            && !r.is_mate_unmapped()
+            && (r.mpos() as u64) >= g_start0
+            && (r.mpos() as u64) < g_end0;
+
+        if read_overlaps || mate_overlaps {
             support.push(r);
         }
     }
+
     if support.is_empty() {
         return Ok(None);
     }
 
-    const MIN_MAPQ: u8 = 20;
-
-    // -------------------------
-    // helper: reference consumed by cigar (M,=,X,D,N)
-    // -------------------------
-    fn ref_consumed(cig: &bam::record::CigarStringView) -> u64 {
-        use bam::record::Cigar::*;
-        let mut n: u64 = 0;
-        for c in cig.iter() {
-            match *c {
-                Match(l) | Equal(l) | Diff(l) | Del(l) | RefSkip(l) => n += l as u64,
-                Ins(_) | SoftClip(_) | HardClip(_) | Pad(_) => {}
-            }
-        }
-        n
-    }
-
-    // -------------------------
-    // helper: parse first SA entry "chr,pos,strand,cigar,mapq,nm;..."
-    // -------------------------
-    fn parse_sa_first(sa: &str) -> Option<(String, u64, String)> {
-        let first = sa.split(';').next()?.trim();
-        if first.is_empty() {
-            return None;
-        }
-        let mut it = first.split(',');
-        let chr = it.next()?.to_string();
-        let pos1: u64 = it.next()?.parse().ok()?; // 1-based
-        let _strand = it.next()?; // not used
-        let cigar = it.next()?.to_string();
-        Some((chr, pos1, cigar))
-    }
-
-    // -------------------------
-    // helper: parse SA cigar ref-consumed (quick parser; avoids CigarString::try_from)
-    // We only need how much reference it consumes.
-    // -------------------------
-    fn sa_ref_consumed(cigar: &str) -> Option<u64> {
-        let mut n: u64 = 0;
-        let mut num: u64 = 0;
-        let mut any = false;
-
-        for ch in cigar.chars() {
-            if ch.is_ascii_digit() {
-                num = num * 10 + (ch as u8 - b'0') as u64;
-                any = true;
-            } else {
-                if !any {
-                    return None;
-                }
-                match ch {
-                    'M' | '=' | 'X' | 'D' | 'N' => n += num,
-                    'I' | 'S' | 'H' | 'P' => {}
-                    _ => return None,
-                }
-                num = 0;
-                any = false;
-            }
-        }
-        // cigar should end in an op; if not, fail
-        if any { return None; }
-        Some(n)
-    }
-
-    // -------------------------
-    // DEL from discordant PE
-    // -------------------------
+    // -------- DEL from PE --------
     if hs.reason == "discordant_del" {
-        const MIN_DEL_BP: u64 = 50;
-        const MIN_PE_SUPPORT: usize = 6;
-        const Z_CUTOFF: f64 = 5.0;
-        const MAX_BP_SPREAD: u64 = 300;
+        if let Some((start0, end0, score)) =
+            confirm_pe_deletion_from_support(&support, insert_mean, insert_sd)
+        {
+            let svlen = -((end0 - start0) as isize);
 
-        if insert_sd <= 0.0 {
-            return Ok(None);
+            return Ok(Some(SvCall {
+                chrom: chrom.into(),
+                pos: start0 + 1, // VCF 1-based
+                end: end0 + 1,
+                svtype: "DEL".into(),
+                len: svlen,
+                score: score as i32,
+                reason: "PE".into(),
+                mate_chrom: None,
+                mate_pos: None,
+            }));
         }
-
-        let mut left_bps: Vec<u64> = Vec::new();
-        let mut right_bps: Vec<u64> = Vec::new();
-        let mut seen_qname: HashSet<Vec<u8>> = HashSet::new();
-
-        for r in &support {
-            if r.is_secondary() || r.is_duplicate() {
-                continue;
-            }
-            if r.mapq() < MIN_MAPQ {
-                continue;
-            }
-            if !(r.is_paired() && !r.is_unmapped() && !r.is_mate_unmapped()) {
-                continue;
-            }
-            if r.tid() != r.mtid() {
-                continue;
-            }
-            if r.is_proper_pair() {
-                continue;
-            }
-
-            // one per pair
-            if r.pos() >= r.mpos() {
-                continue;
-            }
-
-            let tlen = r.insert_size().abs() as f64;
-            let z = (tlen - insert_mean) / insert_sd;
-            if z < Z_CUTOFF {
-                continue;
-            }
-
-            let qn = r.qname().to_vec();
-            if !seen_qname.insert(qn) {
-                continue;
-            }
-
-            let rpos0 = r.pos().max(0) as u64;
-            let mpos0 = r.mpos().max(0) as u64;
-
-            let left0 = rpos0.min(mpos0);
-            let right0 = rpos0.max(mpos0);
-
-            let read_len = r.seq_len() as u64;
-            let left_bp0 = left0 + read_len;
-            let right_bp0 = right0;
-
-            if right_bp0 > left_bp0 {
-                left_bps.push(left_bp0);
-                right_bps.push(right_bp0);
-            }
-        }
-
-        if left_bps.len() < MIN_PE_SUPPORT || right_bps.len() < MIN_PE_SUPPORT {
-            return Ok(None);
-        }
-
-        left_bps.sort_unstable();
-        right_bps.sort_unstable();
-        let left_spread = left_bps[left_bps.len() - 1] - left_bps[0];
-        let right_spread = right_bps[right_bps.len() - 1] - right_bps[0];
-        if left_spread > MAX_BP_SPREAD || right_spread > MAX_BP_SPREAD {
-            return Ok(None);
-        }
-
-        let start0 = median_u64(&mut left_bps);
-        let end0 = median_u64(&mut right_bps);
-
-        if end0 <= start0 || (end0 - start0) < MIN_DEL_BP {
-            return Ok(None);
-        }
-
-        let svlen = -((end0 - start0) as isize);
-        return Ok(Some(SvCall {
-            chrom: chrom.into(),
-            pos: start0 + 1,
-            end: end0 + 1,
-            svtype: "DEL".into(),
-            len: svlen,
-            score: left_bps.len() as i32,
-            reason: "PE".into(),
-            mate_chrom: None,
-            mate_pos: None,
-        }));
+        return Ok(None);
     }
 
-    // -------------------------
-    // BND from inter-chrom PE (minimal)
-    // -------------------------
+    // -------- BND minimal --------
     if hs.reason == "bnd_pe" {
+        const MIN_MAPQ: u8 = 20;
         const MIN_BND_SUPPORT: usize = 3;
         const MAX_POS_SPREAD: u64 = 500;
 
@@ -252,11 +322,6 @@ pub fn confirm_breakpoint(
                 continue;
             }
             if r.tid() == r.mtid() {
-                continue;
-            }
-
-            // one per pair
-            if r.pos() >= r.mpos() {
                 continue;
             }
 
@@ -285,6 +350,7 @@ pub fn confirm_breakpoint(
 
         a_pos.sort_unstable();
         b_pos.sort_unstable();
+
         let a_spread = a_pos[a_pos.len() - 1] - a_pos[0];
         let b_spread = b_pos[b_pos.len() - 1] - b_pos[0];
         if a_spread > MAX_POS_SPREAD || b_spread > MAX_POS_SPREAD {
@@ -307,119 +373,15 @@ pub fn confirm_breakpoint(
         }));
     }
 
-    // -------------------------
-    // SR hotspot: try DEL-from-SA first, else INS-from-softclip
-    // -------------------------
+    // -------- INS from SR-like soft clips --------
     if hs.reason == "soft_clip_sr" {
-        // DEL-from-SA
-        const MIN_DEL_BP: u64 = 50;
-        const MIN_SR_DEL_SUPPORT: usize = 4;
-        const MAX_BP_SPREAD_DEL: u64 = 300;
-
-        // INS-from-softclip (fallback)
+        const MIN_MAPQ: u8 = 20;
         const MIN_SR_SUPPORT: usize = 4;
-        const MAX_POS_SPREAD_INS: u64 = 150;
+        const MAX_POS_SPREAD: u64 = 150;
         const MIN_INS_LEN: isize = 50;
 
-        let min_clip_sr: u32 = (k as u32).max(20);
+        let min_clip_sr: isize = (k as isize).max(20);
 
-        // -------------------------
-        // (1) DEL from SA split reads
-        // -------------------------
-        {
-            let mut left_bps: Vec<u64> = Vec::new();
-            let mut right_bps: Vec<u64> = Vec::new();
-            let mut seen_qname: HashSet<Vec<u8>> = HashSet::new();
-
-            for r in &support {
-                if r.is_secondary() || r.is_duplicate() {
-                    continue;
-                }
-                if r.mapq() < MIN_MAPQ {
-                    continue;
-                }
-
-                // ✅ FIX: Aux handling (no .string() in your rust_htslib)
-                let sa_str: &str = match r.aux(b"SA") {
-                    Ok(bam::record::Aux::String(s)) => s,
-                    _ => continue,
-                };
-
-                let qn = r.qname().to_vec();
-                if !seen_qname.insert(qn) {
-                    continue;
-                }
-
-                let (sa_chr, sa_pos1, sa_cigar_str) = match parse_sa_first(sa_str) {
-                    Some(x) => x,
-                    None => continue,
-                };
-                if sa_chr != chrom {
-                    continue;
-                }
-
-                // primary alignment ref interval
-                let rpos0 = r.pos().max(0) as u64;
-                let r_end0 = rpos0 + ref_consumed(&r.cigar());
-
-                // SA alignment ref interval
-                let sa_pos0 = sa_pos1.saturating_sub(1);
-                let sa_ref = match sa_ref_consumed(&sa_cigar_str) {
-                    Some(x) => x,
-                    None => continue,
-                };
-                let sa_end0 = sa_pos0 + sa_ref;
-
-                // deletion gap between the two blocks
-                let (a0, a1) = (rpos0, r_end0);
-                let (b0, b1) = (sa_pos0, sa_end0);
-
-                let (left_end, right_start) = if a0 <= b0 { (a1, b0) } else { (b1, a0) };
-
-                if right_start <= left_end {
-                    continue;
-                }
-                let del_len = right_start - left_end;
-                if del_len < MIN_DEL_BP {
-                    continue;
-                }
-
-                left_bps.push(left_end);
-                right_bps.push(right_start);
-            }
-
-            if left_bps.len() >= MIN_SR_DEL_SUPPORT && right_bps.len() >= MIN_SR_DEL_SUPPORT {
-                left_bps.sort_unstable();
-                right_bps.sort_unstable();
-
-                let l_spread = left_bps[left_bps.len() - 1] - left_bps[0];
-                let r_spread = right_bps[right_bps.len() - 1] - right_bps[0];
-
-                if l_spread <= MAX_BP_SPREAD_DEL && r_spread <= MAX_BP_SPREAD_DEL {
-                    let start0 = median_u64(&mut left_bps);
-                    let end0 = median_u64(&mut right_bps);
-
-                    if end0 > start0 && (end0 - start0) >= MIN_DEL_BP {
-                        let svlen = -((end0 - start0) as isize);
-                        return Ok(Some(SvCall {
-                            chrom: chrom.into(),
-                            pos: start0 + 1,
-                            end: end0 + 1,
-                            svtype: "DEL".into(),
-                            len: svlen,
-                            score: left_bps.len() as i32,
-                            reason: "SR".into(),
-                            mate_chrom: None,
-                            mate_pos: None,
-                        }));
-                    }
-                }
-            }
-        }
-
-        // -------------------------
-        // (2) INS from SR-like soft clips (fallback)
-        // -------------------------
         let mut clip_lens: Vec<isize> = Vec::new();
         let mut clip_pos0: Vec<u64> = Vec::new();
         let mut seen_qname: HashSet<Vec<u8>> = HashSet::new();
@@ -445,27 +407,22 @@ pub fn confirm_breakpoint(
             let pos0 = r.pos().max(0) as u64;
             let cig = r.cigar();
 
-            let mut ok = false;
-
+            // check softclip on either end
             if let Some(Cigar::SoftClip(n)) = cig.iter().next() {
-                if *n >= min_clip_sr {
-                    ok = true;
-                    clip_lens.push(*n as isize);
+                let n = *n as isize;
+                if n >= min_clip_sr {
+                    clip_lens.push(n);
                     clip_pos0.push(pos0);
+                    continue;
                 }
             }
-            if !ok {
-                if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
-                    if *n >= min_clip_sr {
-                        ok = true;
-                        clip_lens.push(*n as isize);
-                        clip_pos0.push(pos0 + r.seq_len() as u64);
-                    }
+            if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
+                let n = *n as isize;
+                if n >= min_clip_sr {
+                    clip_lens.push(n);
+                    clip_pos0.push(pos0 + ref_consumed_len(&r.cigar()));
+                    continue;
                 }
-            }
-
-            if ok {
-                continue;
             }
         }
 
@@ -475,11 +432,14 @@ pub fn confirm_breakpoint(
 
         clip_pos0.sort_unstable();
         let spread = clip_pos0[clip_pos0.len() - 1] - clip_pos0[0];
-        if spread > MAX_POS_SPREAD_INS {
+        if spread > MAX_POS_SPREAD {
             return Ok(None);
         }
 
-        let approx_len = median_isize(&mut clip_lens);
+        let approx_len = {
+            clip_lens.sort_unstable();
+            clip_lens[clip_lens.len() / 2]
+        };
         if approx_len < MIN_INS_LEN {
             return Ok(None);
         }
@@ -504,27 +464,3 @@ pub fn confirm_breakpoint(
 }
 
 
-
-fn cigar_ref_consumed(cig: &bam::record::CigarStringView) -> u64 {
-    use bam::record::Cigar::*;
-    let mut n: u64 = 0;
-    for c in cig.iter() {
-        match *c {
-            Match(l) | Equal(l) | Diff(l) | Del(l) | RefSkip(l) => n += l as u64,
-            Ins(_) | SoftClip(_) | HardClip(_) | Pad(_) => {}
-        }
-    }
-    n
-}
-
-// Parse first SA entry: "chr,pos,strand,cigar,mapq,nm;..."
-fn parse_sa_first(sa: &str) -> Option<(String, u64, char, String)> {
-    let first = sa.split(';').next()?.trim();
-    if first.is_empty() { return None; }
-    let mut it = first.split(',');
-    let chr = it.next()?.to_string();
-    let pos1: u64 = it.next()?.parse().ok()?; // 1-based
-    let strand: char = it.next()?.chars().next()?;
-    let cigar = it.next()?.to_string();
-    Some((chr, pos1, strand, cigar))
-}

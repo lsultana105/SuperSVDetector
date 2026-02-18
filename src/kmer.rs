@@ -1,8 +1,9 @@
-use hashbrown::HashMap;
+use std::collections::{HashMap, HashSet};
 use rust_htslib::bam;
 use rust_htslib::bam::record::{Cigar, Seq};
 
 use crate::hotspot::Hotspot;
+use rust_htslib::bam::record::Aux;
 
 pub struct MinimizerIndex {
     pub map: HashMap<u64, Vec<usize>>,
@@ -70,31 +71,36 @@ pub fn discover_hotspots(
     insert_mean: f64,
     insert_sd: f64,
 ) -> Vec<Hotspot> {
+    use rust_htslib::bam::record::Cigar;
+    use std::collections::{HashMap, HashSet};
+
     let mut evidence: HashMap<usize, EvidenceCounts> = HashMap::new();
 
-    // ---------- tuning knobs (aiming closer to Lumpy) ----------
     const MIN_MAPQ: u8 = 20;
 
-    // Lumpy-ish discordant filter (discordant_z≈5)
-    const Z_CUTOFF: f64 = 5.0;
+    const Z_CUTOFF: f64 = 3.0;
 
-    // Hotspot support thresholds (raise/lower as needed)
-    const MIN_DEL_PE_SUPPORT: usize = 6;
+    const MIN_DEL_PE_SUPPORT: usize = 2;
     const MIN_BND_SUPPORT: usize = 3;
+    const MIN_SR_SUPPORT: usize = 3;
 
-    // IMPORTANT: SR evidence must be stronger than “any soft clip”
-    const MIN_SR_SUPPORT: usize = 4;
-
-    // window sizes
     const WIN_DISCORDANT: usize = 500;
     const WIN_BND: usize = 500;
     const WIN_SR: usize = 100;
     const WIN_RARE: usize = 200;
 
-    // Rare kmers disabled
     const MIN_RARE_SUPPORT: usize = 999999;
 
-    let min_clip_sr: u32 = 12;
+    let min_clip_sr: u32 = 20;
+
+    let hard_tlen_min: f64 = if insert_sd > 0.0 {
+        (insert_mean + 3.0 * insert_sd).max(800.0)
+    } else {
+        800.0
+    };
+
+    let mut seen_del_pe: HashSet<Vec<u8>> = HashSet::new();
+    let mut seen_bnd_pe: HashSet<Vec<u8>> = HashSet::new();
 
     for r in reads {
         if r.is_secondary() || r.is_duplicate() {
@@ -110,66 +116,80 @@ pub fn discover_hotspots(
         }
         let local = (gpos0 - bin_start) as usize;
 
-        // ---------------------------
-        // 1) PE evidence
-        // ---------------------------
-        if r.is_paired() && !r.is_unmapped() && !r.is_mate_unmapped() {
-            // inter-chrom = BND-ish signal
+        if r.is_paired()
+            && !r.is_unmapped()
+            && !r.is_mate_unmapped()
+            && !r.is_supplementary()
+        {
+            // inter-chrom => BND-ish
             if r.tid() != r.mtid() {
-                // count one per pair
-                if r.pos() < r.mpos() {
-                    let b = (local / WIN_BND) * WIN_BND;
-                    evidence.entry(b).or_default().bnd_pe += 1;
-                }
-                continue;
-            }
-
-            // same chrom: discordant DEL-like
-            // same chrom: discordant DEL-like (do NOT require improper-pair flag)
-            if insert_sd > 0.0 && r.pos() < r.mpos() {
-                let tlen = r.insert_size().abs() as f64;
-                let z = (tlen - insert_mean) / insert_sd;
-                if z >= Z_CUTOFF {
-                    let b = (local / WIN_DISCORDANT) * WIN_DISCORDANT;
-                    evidence.entry(b).or_default().discordant_del += 1;
+                let qn = r.qname().to_vec();
+                if !seen_bnd_pe.insert(qn) {
                     continue;
                 }
+                let b = (local / WIN_BND) * WIN_BND;
+                evidence.entry(b).or_default().bnd_pe += 1;
+                continue;
             }
-        }
 
-        // ---------------------------
-        // 2) SR-like evidence (soft-clip but only if split-ish)
-        //    Lumpy uses splitters BAM. Approximate that by requiring:
-        //      - supplementary OR SA tag present
-        //      - and a sufficiently long soft clip
-        // ---------------------------
-        let has_sa = r.aux(b"SA").is_ok();
-        let is_split_like = has_sa || r.is_supplementary();
+            let tlen = r.insert_size().abs() as f64;
+            let mut is_del_like = false;
 
-        if is_split_like {
-            let cig = r.cigar();
-            let mut ok = false;
-
-            if let Some(Cigar::SoftClip(n)) = cig.iter().next() {
-                if *n >= min_clip_sr { ok = true; }
-            }
-            if !ok {
-                if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
-                    if *n >= min_clip_sr { ok = true; }
+            if insert_sd > 0.0 {
+                let z = (tlen - insert_mean) / insert_sd;
+                if z >= Z_CUTOFF {
+                    is_del_like = true;
                 }
             }
 
-            if ok {
-                let b = (local / WIN_SR) * WIN_SR;
-                evidence.entry(b).or_default().soft_clip_sr += 1;
+            if tlen >= hard_tlen_min {
+                is_del_like = true;
+            }
+
+            if is_del_like {
+                let qn = r.qname().to_vec();
+                if !seen_del_pe.insert(qn) {
+                    continue;
+                }
+
+                let rpos0 = r.pos().max(0) as u64;
+                let mpos0 = r.mpos().max(0) as u64;
+                let left0 = rpos0.min(mpos0);
+
+                if left0 >= bin_start {
+                    let left_local = (left0 - bin_start) as usize;
+                    let b = (left_local / WIN_DISCORDANT) * WIN_DISCORDANT;
+                    evidence.entry(b).or_default().discordant_del += 1;
+                }
                 continue;
             }
         }
 
-        // ---------------------------
-        // 3) Rare kmers (disabled)
-        // ---------------------------
-        if r.seq_len() >= k {
+        // soft clip SR
+        let cig = r.cigar();
+        let mut ok = false;
+
+        if let Some(Cigar::SoftClip(n)) = cig.iter().next() {
+            if *n >= min_clip_sr {
+                ok = true;
+            }
+        }
+        if !ok {
+            if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
+                if *n >= min_clip_sr {
+                    ok = true;
+                }
+            }
+        }
+
+        if ok {
+            let b = (local / WIN_SR) * WIN_SR;
+            evidence.entry(b).or_default().soft_clip_sr += 1;
+            continue;
+        }
+
+        // rare kmer (disabled by default)
+        if MIN_RARE_SUPPORT != 999999 && r.seq_len() >= k {
             let seq = r.seq();
             let (mut rare, mut total) = (0usize, 0usize);
 
@@ -192,16 +212,28 @@ pub fn discover_hotspots(
     let mut out: Vec<Hotspot> = Vec::new();
     for (bin, c) in evidence.into_iter() {
         if c.discordant_del >= MIN_DEL_PE_SUPPORT {
-            out.push(Hotspot { local_pos: bin, reason: "discordant_del".into() });
+            out.push(Hotspot {
+                local_pos: bin,
+                reason: "discordant_del".into(),
+            });
         }
         if c.bnd_pe >= MIN_BND_SUPPORT {
-            out.push(Hotspot { local_pos: bin, reason: "bnd_pe".into() });
+            out.push(Hotspot {
+                local_pos: bin,
+                reason: "bnd_pe".into(),
+            });
         }
         if c.soft_clip_sr >= MIN_SR_SUPPORT {
-            out.push(Hotspot { local_pos: bin, reason: "soft_clip_sr".into() });
+            out.push(Hotspot {
+                local_pos: bin,
+                reason: "soft_clip_sr".into(),
+            });
         }
         if c.rare_kmer >= MIN_RARE_SUPPORT {
-            out.push(Hotspot { local_pos: bin, reason: "rare_kmer".into() });
+            out.push(Hotspot {
+                local_pos: bin,
+                reason: "rare_kmer".into(),
+            });
         }
     }
 

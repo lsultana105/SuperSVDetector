@@ -195,50 +195,122 @@ pub fn process_bin(
     tid_names: &[String],
 ) -> Result<()> {
     use crate::io_utils::*;
+    use rayon::prelude::*;
 
     const EDGE_MARGIN: usize = 2000;
 
-    let ref_window = fetch_reference_window(ref_fa, &bin.chrom, bin.start, bin.end)?;
-    let sfx = SuffixWorkspace::build(&ref_window);
+    // -------- Optional generic debug (NO hardcoding) --------
+    let debug_enabled = std::env::var("SSV_DEBUG").is_ok();
 
-    let mut reader = open_bam(bam_path)?;
-    let reads = fetch_reads_overlapping(&mut reader, &bin.chrom, bin.start, bin.end)?;
-
-    let mindex = MinimizerIndex::build(&ref_window, k, w);
-    let mut hotspots = discover_hotspots(&reads, &mindex, k, bin.start, insert_mean, insert_sd);
-
-    let needs_expansion = hotspot_near_boundary(&hotspots[..], ref_window.len(), EDGE_MARGIN);
-
-    let (final_ref_window, final_bin_start) = if needs_expansion {
-        let mut new_start = bin.start.saturating_sub(EDGE_MARGIN as u64);
-        let mut new_end = bin.end + EDGE_MARGIN as u64;
-
-        let extended = match fetch_reference_window(ref_fa, &bin.chrom, new_start, new_end) {
-            Ok(seq) => {
-                if new_start < bin.start {
-                    let shift = (bin.start - new_start) as usize;
-                    for hs in &mut hotspots {
-                        hs.local_pos += shift;
+    // If set, only debug bins overlapping this region: "chr:start-end"
+    let debug_region = std::env::var("SSV_DEBUG_REGION").ok();
+    let debug_this_bin = if !debug_enabled {
+        false
+    } else if let Some(spec) = debug_region.as_deref() {
+        // parse "chr1:119000000-120000000"
+        let mut ok = false;
+        if let Some((chr, rest)) = spec.split_once(':') {
+            if chr == bin.chrom {
+                if let Some((s, e)) = rest.split_once('-') {
+                    if let (Ok(rs), Ok(re)) = (s.parse::<u64>(), e.parse::<u64>()) {
+                        // overlap check
+                        ok = bin.start < re && bin.end > rs;
                     }
                 }
-                seq
             }
-            Err(e) => {
-                log::warn!(
-                    "Extended fetch [{}, {}) for {} failed: {}. Falling back to original bin [{}, {}).",
-                    new_start, new_end, bin.chrom, e, bin.start, bin.end
-                );
-                new_start = bin.start;
-                new_end = bin.end;
-                fetch_reference_window(ref_fa, &bin.chrom, new_start, new_end)?
-            }
-        };
-
-        (extended, new_start)
+        }
+        ok
     } else {
-        (ref_window.clone(), bin.start)
+        true
+    };
+    // --------------------------------------------------------
+
+    // 1) Fetch reference for original bin
+    let ref_window0 = fetch_reference_window(ref_fa, &bin.chrom, bin.start, bin.end)?;
+    let mut sfx = SuffixWorkspace::build(&ref_window0);
+
+    // 2) Fetch reads for original bin
+    let mut reader0 = open_bam(bam_path)?;
+    let reads0 = fetch_reads_overlapping(&mut reader0, &bin.chrom, bin.start, bin.end)?;
+
+    if debug_this_bin {
+        log::warn!(
+            "[BIN] {}:{}-{} reads={} insert_mean={} insert_sd={}",
+            bin.chrom, bin.start, bin.end, reads0.len(), insert_mean, insert_sd
+        );
+    }
+
+    // 3) Discover hotspots (on original window + original reads)
+    let mindex0 = MinimizerIndex::build(&ref_window0, k, w);
+    let mut hotspots = discover_hotspots(&reads0, &mindex0, k, bin.start, insert_mean, insert_sd);
+
+    if debug_this_bin {
+        let mut d = 0usize;
+        let mut b = 0usize;
+        let mut s = 0usize;
+        for h in &hotspots {
+            match h.reason.as_str() {
+                "discordant_del" => d += 1,
+                "bnd_pe" => b += 1,
+                "soft_clip_sr" => s += 1,
+                _ => {}
+            }
+        }
+        log::warn!(
+            "[BIN] hotspots total={} discordant_del={} bnd_pe={} soft_clip_sr={}",
+            hotspots.len(),
+            d,
+            b,
+            s
+        );
+    }
+
+    // 4) Expand if any hotspot near boundary
+    let needs_expansion = hotspot_near_boundary(&hotspots[..], ref_window0.len(), EDGE_MARGIN);
+
+    // Finalize (ref_window, bin_start, reads) so they match each other.
+    let (final_ref_window, final_bin_start, final_reads) = if needs_expansion {
+        let new_start = bin.start.saturating_sub(EDGE_MARGIN as u64);
+        let new_end = bin.end + EDGE_MARGIN as u64;
+
+        if debug_this_bin {
+            log::warn!(
+                "[BIN] expanding: old=[{}-{}] new=[{}-{}]",
+                bin.start, bin.end, new_start, new_end
+            );
+        }
+
+        let extended_ref = fetch_reference_window(ref_fa, &bin.chrom, new_start, new_end)?;
+
+        // shift hotspot local_pos because local coordinate system changed
+        if new_start < bin.start {
+            let shift = (bin.start - new_start) as usize;
+            for hs in &mut hotspots {
+                hs.local_pos += shift;
+            }
+        }
+
+        // ✅ CRITICAL: refetch reads for expanded region too
+        let mut reader1 = open_bam(bam_path)?;
+        let reads1 = fetch_reads_overlapping(&mut reader1, &bin.chrom, new_start, new_end)?;
+
+        // suffix must match expanded ref
+        sfx = SuffixWorkspace::build(&extended_ref);
+
+        if debug_this_bin {
+            log::warn!(
+                "[BIN] expanded ref_len={} reads={}",
+                extended_ref.len(),
+                reads1.len()
+            );
+        }
+
+        (extended_ref, new_start, reads1)
+    } else {
+        (ref_window0, bin.start, reads0)
     };
 
+    // 5) Confirm hotspots in parallel
     let calls: Vec<_> = hotspots
         .into_par_iter()
         .filter_map(|hs| {
@@ -251,7 +323,7 @@ pub fn process_bin(
                 band,
                 insert_mean,
                 insert_sd,
-                &reads,
+                &final_reads,
                 k,
                 tid_names,
             )
@@ -260,6 +332,14 @@ pub fn process_bin(
         })
         .collect();
 
+    if debug_this_bin {
+        log::warn!("[BIN] calls_written={}", calls.len());
+    }
+
     vcfout::write_bin_json(outdir, &bin, &calls)?;
     Ok(())
 }
+
+
+
+
