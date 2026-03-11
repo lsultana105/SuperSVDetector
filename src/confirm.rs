@@ -373,17 +373,17 @@ pub fn confirm_breakpoint(
         }));
     }
 
-    // -------- INS from SR-like soft clips --------
+    // -------- INS from SR-like evidence (soft clips OR large CIGAR I) --------
     if hs.reason == "soft_clip_sr" {
         const MIN_MAPQ: u8 = 20;
-        const MIN_SR_SUPPORT: usize = 4;
-        const MAX_POS_SPREAD: u64 = 150;
+        const MIN_SR_SUPPORT: usize = 3; // was 4; 3 is more realistic for synthetic
+        const MAX_POS_SPREAD: u64 = 300; // slightly looser for INS
         const MIN_INS_LEN: isize = 50;
 
         let min_clip_sr: isize = (k as isize).max(20);
 
-        let mut clip_lens: Vec<isize> = Vec::new();
-        let mut clip_pos0: Vec<u64> = Vec::new();
+        let mut lens: Vec<isize> = Vec::new();
+        let mut pos0s: Vec<u64> = Vec::new();
         let mut seen_qname: HashSet<Vec<u8>> = HashSet::new();
 
         for r in &support {
@@ -391,11 +391,6 @@ pub fn confirm_breakpoint(
                 continue;
             }
             if r.mapq() < MIN_MAPQ {
-                continue;
-            }
-
-            let split_like = r.is_supplementary() || r.aux(b"SA").is_ok();
-            if !split_like {
                 continue;
             }
 
@@ -407,44 +402,60 @@ pub fn confirm_breakpoint(
             let pos0 = r.pos().max(0) as u64;
             let cig = r.cigar();
 
-            // check softclip on either end
-            if let Some(Cigar::SoftClip(n)) = cig.iter().next() {
-                let n = *n as isize;
+            // 1) Prefer explicit large insertions in the CIGAR
+            let mut took = false;
+            for c in cig.iter() {
+                if let Cigar::Ins(nu) = c {
+                    let n = *nu as isize;
+                    if n >= MIN_INS_LEN {
+                        let ipos = insertion_ref_pos(r).unwrap_or(pos0);
+                        lens.push(n);
+                        pos0s.push(ipos);
+                        took = true;
+                        break;
+                    }
+                }
+            }
+            if took {
+                continue; // don't double-count via soft-clips for same read
+            }
+
+            // 2) Otherwise fall back to strong soft-clips (no SA/supp requirement)
+            if let Some(Cigar::SoftClip(nu)) = cig.iter().next() {
+                let n = *nu as isize;
                 if n >= min_clip_sr {
-                    clip_lens.push(n);
-                    clip_pos0.push(pos0);
+                    lens.push(n);
+                    pos0s.push(pos0);
                     continue;
                 }
             }
-            if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
-                let n = *n as isize;
+            if let Some(Cigar::SoftClip(nu)) = cig.iter().last() {
+                let n = *nu as isize;
                 if n >= min_clip_sr {
-                    clip_lens.push(n);
-                    clip_pos0.push(pos0 + ref_consumed_len(&r.cigar()));
+                    lens.push(n);
+                    pos0s.push(pos0 + ref_consumed_len(&r.cigar()));
                     continue;
                 }
             }
         }
 
-        if clip_lens.len() < MIN_SR_SUPPORT {
+        if lens.len() < MIN_SR_SUPPORT {
             return Ok(None);
         }
 
-        clip_pos0.sort_unstable();
-        let spread = clip_pos0[clip_pos0.len() - 1] - clip_pos0[0];
+        pos0s.sort_unstable();
+        let spread = pos0s[pos0s.len() - 1] - pos0s[0];
         if spread > MAX_POS_SPREAD {
             return Ok(None);
         }
 
-        let approx_len = {
-            clip_lens.sort_unstable();
-            clip_lens[clip_lens.len() / 2]
-        };
+        lens.sort_unstable();
+        let approx_len = lens[lens.len() / 2];
         if approx_len < MIN_INS_LEN {
             return Ok(None);
         }
 
-        let ins0 = median_u64(&mut clip_pos0);
+        let ins0 = median_u64(&mut pos0s);
         let pos_vcf = ins0 + 1;
 
         return Ok(Some(SvCall {
@@ -453,7 +464,7 @@ pub fn confirm_breakpoint(
             end: pos_vcf,
             svtype: "INS".into(),
             len: approx_len,
-            score: clip_lens.len() as i32,
+            score: lens.len() as i32,
             reason: "SR".into(),
             mate_chrom: None,
             mate_pos: None,
@@ -462,5 +473,16 @@ pub fn confirm_breakpoint(
 
     Ok(None)
 }
-
+fn insertion_ref_pos(r: &bam::Record) -> Option<u64> {
+    use rust_htslib::bam::record::Cigar::*;
+    let mut ref_pos = r.pos().max(0) as u64;
+    for c in r.cigar().iter() {
+        match c {
+            Match(n) | Diff(n) | Equal(n) | Del(n) | RefSkip(n) => ref_pos += *n as u64,
+            Ins(_n) => return Some(ref_pos), // insertion occurs *between* ref bases here
+            SoftClip(_) | HardClip(_) | Pad(_) => {}
+        }
+    }
+    None
+}
 

@@ -182,6 +182,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn get_contig_len_from_fai(ref_fa: &str, chrom: &str) -> Result<u64> {
+    use anyhow::anyhow;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let fai_path = format!("{}.fai", ref_fa);
+    let file = File::open(&fai_path)?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 2 && parts[0] == chrom {
+            return Ok(parts[1].parse::<u64>()?);
+        }
+    }
+
+    Err(anyhow!("Chromosome {} not found in FASTA index {}", chrom, fai_path))
+}
 pub fn process_bin(
     ref_fa: &str,
     bam_path: &str,
@@ -270,8 +289,9 @@ pub fn process_bin(
 
     // Finalize (ref_window, bin_start, reads) so they match each other.
     let (final_ref_window, final_bin_start, final_reads) = if needs_expansion {
+        let contig_len = get_contig_len_from_fai(ref_fa, &bin.chrom)?;
         let new_start = bin.start.saturating_sub(EDGE_MARGIN as u64);
-        let new_end = bin.end + EDGE_MARGIN as u64;
+        let new_end = (bin.end + EDGE_MARGIN as u64).min(contig_len);
 
         if debug_this_bin {
             log::warn!(
