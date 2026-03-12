@@ -1,136 +1,195 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use mpi::traits::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{bins, io_utils};
+use crate::bins::Bin;
+use crate::io_utils::WorkerIo;
+use crate::process_bin::{process_bin_with_readers, CallConfig};
+use crate::vcfout;
 
-#[derive(Serialize, Deserialize)]
-struct BinMsg {
+const TAG_WORK: i32 = 1;
+const TAG_STOP: i32 = 2;
+const TAG_DONE: i32 = 3;
+const TAG_ERR: i32 = 4;
+
+#[derive(Serialize, Deserialize, Debug)]
+struct WorkerDone {
+    rank: i32,
     chrom: String,
     start: u64,
     end: u64,
 }
 
-impl From<bins::Bin> for BinMsg {
-    fn from(b: bins::Bin) -> Self {
-        BinMsg {
-            chrom: b.chrom,
-            start: b.start,
-            end: b.end,
-        }
-    }
+#[derive(Serialize, Deserialize, Debug)]
+struct WorkerErr {
+    rank: i32,
+    chrom: String,
+    start: u64,
+    end: u64,
+    message: String,
 }
 
 pub fn run_mpi(
-    ref_fa: &str,
-    bam: &str,
-    bins_path: &str,
-    outdir: &str,
-    band: usize,
-    k: usize,
-    w: usize,
-    insert_mean: f64,
-    insert_sd: f64,
-    tid_names: &[String],
+    bam_path: &str,
+    fasta_path: &str,
+    bins: Vec<Bin>,
+    cfg: CallConfig,
 ) -> Result<()> {
-    let universe = mpi::initialize().expect("MPI init failed");
+    let universe = mpi::initialize().ok_or_else(|| anyhow!("failed to initialize MPI"))?;
     let world = universe.world();
-    let (rank, size) = (world.rank(), world.size());
+    let rank = world.rank();
+    let size = world.size();
 
-    // ✅ FIX: if size==1, run locally on rank 0 (no workers exist)
-    if size == 1 {
-        if rank == 0 {
-            eprintln!("[RANK 0] size==1: running bins locally (no MPI workers).");
-            let bins = io_utils::read_bins(bins_path)?;
-            for bin in bins {
-                if let Err(e) = crate::process_bin(
-                    ref_fa,
-                    bam,
-                    outdir,
-                    bin,
-                    band,
-                    k,
-                    w,
-                    insert_mean,
-                    insert_sd,
-                    tid_names,
-                ) {
-                    eprintln!("[RANK 0] bin failed: {}", e);
+    if size < 2 {
+        return Err(anyhow!(
+            "MPI run requires at least 2 ranks (1 master + 1 worker)"
+        ));
+    }
+
+    if rank == 0 {
+        run_master(&world, bins)
+    } else {
+        run_worker(&world, bam_path, fasta_path, cfg)
+    }
+}
+
+fn run_master<C: mpi::topology::Communicator>(world: &C, bins: Vec<Bin>) -> Result<()> {
+    let worker_count = world.size() - 1;
+    let total = bins.len();
+    let mut next_idx = 0usize;
+
+    for worker_rank in 1..=worker_count {
+        if next_idx < total {
+            send_bin(world, worker_rank, &bins[next_idx])?;
+            next_idx += 1;
+        } else {
+            send_stop(world, worker_rank);
+        }
+    }
+
+    let mut completed = 0usize;
+
+    while completed < total {
+        let (msg, status) = world.any_process().receive_vec::<u8>();
+        let src = status.source_rank();
+        let tag = status.tag();
+
+        match tag {
+            TAG_DONE => {
+                let done: WorkerDone = serde_json::from_slice(&msg)?;
+                eprintln!(
+                    "[master] done from rank {} -> {}:{}-{}",
+                    done.rank, done.chrom, done.start, done.end
+                );
+
+                completed += 1;
+
+                if next_idx < total {
+                    send_bin(world, src, &bins[next_idx])?;
+                    next_idx += 1;
+                } else {
+                    send_stop(world, src);
                 }
             }
-        }
-        return Ok(());
-    }
+            TAG_ERR => {
+                let err: WorkerErr = serde_json::from_slice(&msg)?;
+                eprintln!(
+                    "[master] ERROR from rank {} on {}:{}-{} -> {}",
+                    err.rank, err.chrom, err.start, err.end, err.message
+                );
 
-    // Master
-    if rank == 0 {
-        eprintln!("[MASTER] Initializing... Total Ranks: {}", size);
-        eprintln!("[MASTER] Reading bins from: {}", bins_path);
+                completed += 1;
 
-        let mut all_bins = io_utils::read_bins(bins_path)?;
-        eprintln!("[MASTER] Loaded {} bins. Starting distribution...", all_bins.len());
-
-        let mut finished_workers = 0;
-
-        while finished_workers < (size - 1) {
-            // workers send "ready" pings
-            let (_, status) = world.any_process().receive_vec::<u8>();
-            let worker = status.source_rank();
-
-            if let Some(bin) = all_bins.pop() {
-                let msg = BinMsg::from(bin);
-                let encoded = bincode::serialize(&msg)?;
-                world.process_at_rank(worker).send(&encoded[..]);
-            } else {
-                eprintln!("[MASTER] No more bins. Sending shutdown to Rank {}", worker);
-                world.process_at_rank(worker).send(&[] as &[u8]);
-                finished_workers += 1;
+                if next_idx < total {
+                    send_bin(world, src, &bins[next_idx])?;
+                    next_idx += 1;
+                } else {
+                    send_stop(world, src);
+                }
             }
-        }
-
-        eprintln!("[MASTER] All tasks complete. Finalizing...");
-        return Ok(());
-    }
-
-    // Workers
-    eprintln!("[RANK {}] Worker online.", rank);
-    loop {
-        // ping master that we are ready
-        world.process_at_rank(0).send(&[1u8] as &[u8]);
-
-        let (encoded, _) = world.process_at_rank(0).receive_vec::<u8>();
-        if encoded.is_empty() {
-            eprintln!("[RANK {}] Shutting down.", rank);
-            break;
-        }
-
-        let msg: BinMsg = bincode::deserialize(&encoded)?;
-        let bin = bins::Bin {
-            chrom: msg.chrom,
-            start: msg.start,
-            end: msg.end,
-        };
-
-        eprintln!(
-            "[RANK {}] Working on {}:{}-{}",
-            rank, bin.chrom, bin.start, bin.end
-        );
-
-        if let Err(e) = crate::process_bin(
-            ref_fa,
-            bam,
-            outdir,
-            bin,
-            band,
-            k,
-            w,
-            insert_mean,
-            insert_sd,
-            tid_names,
-        ) {
-            eprintln!("[RANK {}] ERROR in process_bin: {}", rank, e);
+            _ => {
+                return Err(anyhow!("master received unexpected MPI tag {}", tag));
+            }
         }
     }
 
     Ok(())
+}
+
+fn run_worker<C: mpi::topology::Communicator>(
+    world: &C,
+    bam_path: &str,
+    fasta_path: &str,
+    cfg: CallConfig,
+) -> Result<()> {
+    let rank = world.rank();
+
+    // Open BAM + FASTA once per worker process
+    let mut io = WorkerIo::new(bam_path, fasta_path)?;
+
+    loop {
+        let (msg, status) = world.process_at_rank(0).receive_vec::<u8>();
+        let tag = status.tag();
+
+        match tag {
+            TAG_WORK => {
+                let bin: Bin = serde_json::from_slice(&msg)?;
+
+                match process_bin_with_readers(&mut io, &bin, &cfg) {
+                    Ok(calls) => {
+                        vcfout::write_bin_json(&cfg.out_dir, &bin, &calls)?;
+
+                        let done = WorkerDone {
+                            rank,
+                            chrom: bin.chrom.clone(),
+                            start: bin.start,
+                            end: bin.end,
+                        };
+                        let payload = serde_json::to_vec(&done)?;
+                        world.process_at_rank(0).send_with_tag(&payload[..], TAG_DONE);
+                    }
+                    Err(e) => {
+                        let err = WorkerErr {
+                            rank,
+                            chrom: bin.chrom.clone(),
+                            start: bin.start,
+                            end: bin.end,
+                            message: e.to_string(),
+                        };
+                        let payload = serde_json::to_vec(&err)?;
+                        world.process_at_rank(0).send_with_tag(&payload[..], TAG_ERR);
+                    }
+                }
+            }
+            TAG_STOP => break,
+            _ => {
+                return Err(anyhow!(
+                    "worker rank {} received unexpected MPI tag {}",
+                    rank,
+                    tag
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn send_bin<C: mpi::topology::Communicator>(
+    world: &C,
+    worker_rank: i32,
+    bin: &Bin,
+) -> Result<()> {
+    let payload = serde_json::to_vec(bin)?;
+    world
+        .process_at_rank(worker_rank)
+        .send_with_tag(&payload[..], TAG_WORK);
+    Ok(())
+}
+
+fn send_stop<C: mpi::topology::Communicator>(world: &C, worker_rank: i32) {
+    let empty: [u8; 0] = [];
+    world
+        .process_at_rank(worker_rank)
+        .send_with_tag(&empty[..], TAG_STOP);
 }

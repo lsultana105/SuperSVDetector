@@ -1,144 +1,224 @@
-use anyhow::{Result, anyhow};
-use rust_htslib::bam::{self, Read};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use anyhow::{anyhow, Context, Result};
 use bio::io::fasta;
+use rust_htslib::bam;
+use rust_htslib::bam::Read;
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
 
 use crate::bins::Bin;
 
-pub fn tid_to_name(reader: &bam::IndexedReader, tid: i32) -> Option<String> {
-    if tid < 0 { return None; }
-    let hdr = reader.header().to_owned();
-    let bytes: &[u8] = hdr.tid2name(tid as u32);
-    Some(String::from_utf8_lossy(bytes).to_string())
+pub struct WorkerIo {
+    pub bam: bam::IndexedReader,
+    pub fasta: fasta::IndexedReader<File>,
+    pub tid_cache: HashMap<String, u32>,
+    pub tid_names: Vec<String>,
 }
 
-/// Fetch a reference subsequence [start, end) for a given chromosome.
-pub fn fetch_reference_window<P: AsRef<Path> + std::fmt::Debug>(
-    ref_fa: P,
+impl WorkerIo {
+    pub fn new<P: AsRef<Path> + std::fmt::Debug>(bam_path: P, fasta_path: P) -> Result<Self> {
+        let bam = bam::IndexedReader::from_path(bam_path.as_ref())
+            .with_context(|| format!("failed to open BAM: {}", bam_path.as_ref().display()))?;
+
+        let fasta = fasta::IndexedReader::from_file(&fasta_path)
+            .map_err(|e| anyhow!("failed to open FASTA {}: {}", fasta_path.as_ref().display(), e))?;
+
+        let header = bam.header().to_owned();
+        let mut tid_names = Vec::new();
+        for tid in 0..header.target_count() {
+            let name = String::from_utf8_lossy(header.tid2name(tid)).to_string();
+            tid_names.push(name);
+        }
+
+        Ok(Self {
+            bam,
+            fasta,
+            tid_cache: HashMap::new(),
+            tid_names,
+        })
+    }
+
+    pub fn tid_for_chrom(&mut self, chrom: &str) -> Result<u32> {
+        if let Some(&tid) = self.tid_cache.get(chrom) {
+            return Ok(tid);
+        }
+
+        let tid = self
+            .bam
+            .header()
+            .tid(chrom.as_bytes())
+            .ok_or_else(|| anyhow!("chromosome '{}' not found in BAM header", chrom))?;
+
+        self.tid_cache.insert(chrom.to_string(), tid);
+        Ok(tid)
+    }
+}
+
+pub fn fetch_reference_window_with_reader(
+    fasta_reader: &mut fasta::IndexedReader<File>,
     chrom: &str,
     start: u64,
     end: u64,
 ) -> Result<Vec<u8>> {
-    let mut rdr = fasta::IndexedReader::from_file(&ref_fa)?;
+    fasta_reader
+        .fetch(chrom, start, end)
+        .map_err(|e| anyhow!("FASTA fetch failed for {}:{}-{}: {}", chrom, start, end, e))?;
 
-    rdr.fetch(chrom, start, end)?;
-
-    let mut seq: Vec<u8> = Vec::new();
-    rdr.read(&mut seq)?;
-
-    for b in seq.iter_mut() {
-        *b = b.to_ascii_uppercase();
-    }
+    let mut seq = Vec::new();
+    fasta_reader
+        .read(&mut seq)
+        .map_err(|e| anyhow!("FASTA read failed for {}:{}-{}: {}", chrom, start, end, e))?;
 
     Ok(seq)
 }
 
-pub fn open_bam(path: &str) -> Result<bam::IndexedReader> {
-    Ok(bam::IndexedReader::from_path(path)?)
-}
-
-pub fn fetch_reads_overlapping(
-    reader: &mut bam::IndexedReader,
+pub fn fetch_reads_overlapping_with_reader(
+    io: &mut WorkerIo,
     chrom: &str,
     start: u64,
     end: u64,
 ) -> Result<Vec<bam::Record>> {
-    let header = reader.header().to_owned();
-    let tid = header
-        .tid(chrom.as_bytes())
-        .ok_or_else(|| anyhow!("chrom not found: {chrom}"))? as u32;
+    let tid = io.tid_for_chrom(chrom)?;
 
-    reader.fetch((tid, start as i64, end as i64))?;
-    let mut v = Vec::new();
-    for r in reader.records() {
-        v.push(r?);
+    io.bam
+        .fetch((tid, start, end))
+        .map_err(|e| anyhow!("BAM fetch failed for {}:{}-{}: {}", chrom, start, end, e))?;
+
+    let mut reads = Vec::new();
+    for rec_result in io.bam.records() {
+        let rec = rec_result.map_err(|e| anyhow!("error reading BAM record: {}", e))?;
+        reads.push(rec);
     }
-    Ok(v)
+
+    Ok(reads)
 }
 
-pub fn read_bins(bins_path: &str) -> Result<Vec<Bin>> {
-    let fh = File::open(bins_path)?;
-    let br = BufReader::new(fh);
-    let mut out = Vec::new();
-    for line in br.lines() {
-        let l = line?;
-        if l.trim().is_empty() {
+pub fn read_bins<P: AsRef<Path>>(bins_path: P) -> Result<Vec<Bin>> {
+    let text = std::fs::read_to_string(&bins_path)
+        .with_context(|| format!("failed to read bins file: {}", bins_path.as_ref().display()))?;
+
+    let mut bins = Vec::new();
+
+    for (i, line) in text.lines().enumerate() {
+        let line_no = i + 1;
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let parts: Vec<_> = l.split('\t').collect();
-        let b = Bin {
-            chrom: parts[0].to_string(),
-            start: parts[1].parse()?,
-            end: parts[2].parse()?,
-        };
-        out.push(b);
+
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() != 3 {
+            return Err(anyhow!(
+                "invalid bins line {} in {}: expected 3 columns, got {} -> '{}'",
+                line_no,
+                bins_path.as_ref().display(),
+                parts.len(),
+                line
+            ));
+        }
+
+        let chrom = parts[0].to_string();
+        let start: u64 = parts[1]
+            .parse()
+            .with_context(|| format!("invalid start at line {}: '{}'", line_no, parts[1]))?;
+        let end: u64 = parts[2]
+            .parse()
+            .with_context(|| format!("invalid end at line {}: '{}'", line_no, parts[2]))?;
+
+        if end <= start {
+            return Err(anyhow!(
+                "invalid bin at line {}: end ({}) must be > start ({})",
+                line_no,
+                end,
+                start
+            ));
+        }
+
+        bins.push(Bin { chrom, start, end });
     }
-    Ok(out)
+
+    Ok(bins)
 }
 
+pub fn estimate_insert_stats<P: AsRef<Path>>(bam_path: P) -> Result<(f64, f64)> {
+    let mut reader = bam::Reader::from_path(bam_path.as_ref())
+        .with_context(|| format!("failed to open BAM for insert stats: {}", bam_path.as_ref().display()))?;
 
-/// Estimate insert size mean and standard deviation (TLEN) for proper pairs.
-/// Filters extreme TLENs to avoid insane values.
-///
-/// Returns (mean, sd). If insufficient data, returns (0.0, 0.0).
-pub fn estimate_insert_stats(bam_path: &str) -> Result<(f64, f64)> {
-    let mut reader = bam::Reader::from_path(bam_path)?;
+    const MAX_READS: usize = 200_000;
+    const MIN_MAPQ: u8 = 20;
 
     let mut vals: Vec<f64> = Vec::new();
-    vals.reserve(200_000);
 
-    for rec in reader.records() {
-        let r = rec?;
-
-        // keep only clean-ish proper pairs
-        if !r.is_paired() || r.is_unmapped() || r.is_mate_unmapped() {
+    for rec_result in reader.records().take(MAX_READS) {
+        let rec = rec_result?;
+        if rec.is_secondary() || rec.is_supplementary() || rec.is_duplicate() {
             continue;
         }
-        if r.is_secondary() || r.is_duplicate() {
+        if rec.mapq() < MIN_MAPQ {
             continue;
         }
-        if r.tid() != r.mtid() {
+        if !(rec.is_paired() && !rec.is_unmapped() && !rec.is_mate_unmapped()) {
             continue;
         }
-        if !r.is_proper_pair() {
+        if rec.tid() != rec.mtid() {
             continue;
         }
 
-        let tlen = r.insert_size().abs() as f64;
-
-        // Keep plausible values (tune if needed)
-        if tlen <= 0.0 || tlen > 2000.0 {
-            continue;
-        }
-
-        vals.push(tlen);
-
-        // cap sample size for speed (optional)
-        if vals.len() >= 200_000 {
-            break;
+        let tlen = rec.insert_size().abs();
+        if tlen > 0 {
+            vals.push(tlen as f64);
         }
     }
 
-    if vals.len() < 2000 {
+    if vals.len() < 10 {
         return Ok((0.0, 0.0));
     }
 
-    let n = vals.len() as f64;
-    let mean = vals.iter().sum::<f64>() / n;
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let var = vals
+    let n = vals.len();
+    let lo = n / 20;
+    let hi = n - (n / 20);
+    let trimmed = &vals[lo..hi];
+
+    if trimmed.is_empty() {
+        return Ok((0.0, 0.0));
+    }
+
+    let mean = trimmed.iter().sum::<f64>() / trimmed.len() as f64;
+    let var = trimmed
         .iter()
         .map(|x| {
-            let d = x - mean;
+            let d = *x - mean;
             d * d
         })
         .sum::<f64>()
-        / (n - 1.0);
-
+        / trimmed.len() as f64;
     let sd = var.sqrt();
 
     Ok((mean, sd))
 }
 
+pub fn get_contig_len_from_fai<P: AsRef<Path>>(ref_fa: P, chrom: &str) -> Result<u64> {
+    use std::io::{BufRead, BufReader};
+
+    let fai_path = format!("{}.fai", ref_fa.as_ref().display());
+    let file = File::open(&fai_path)
+        .with_context(|| format!("failed to open FASTA index {}", fai_path))?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 2 && parts[0] == chrom {
+            return Ok(parts[1].parse::<u64>()?);
+        }
+    }
+
+    Err(anyhow!(
+        "chromosome {} not found in FASTA index {}",
+        chrom,
+        fai_path
+    ))
+}
