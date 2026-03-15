@@ -148,7 +148,7 @@ pub fn estimate_insert_stats<P: AsRef<Path>>(bam_path: P) -> Result<(f64, f64)> 
     const MAX_READS: usize = 200_000;
     const MIN_MAPQ: u8 = 20;
 
-    let mut vals: Vec<f64> = Vec::new();
+    let mut insert_sizes: Vec<f64> = Vec::new();
 
     for rec_result in reader.records().take(MAX_READS) {
         let rec = rec_result?;
@@ -167,34 +167,34 @@ pub fn estimate_insert_stats<P: AsRef<Path>>(bam_path: P) -> Result<(f64, f64)> 
 
         let tlen = rec.insert_size().abs();
         if tlen > 0 {
-            vals.push(tlen as f64);
+            insert_sizes.push(tlen as f64);
         }
     }
 
-    if vals.len() < 10 {
+    if insert_sizes.len() < 10 {
         return Ok((0.0, 0.0));
     }
 
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    insert_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let n = vals.len();
+    let n = insert_sizes.len();
     let lo = n / 20;
     let hi = n - (n / 20);
-    let trimmed = &vals[lo..hi];
+    let trimmed_insert_sizes = &insert_sizes[lo..hi];
 
-    if trimmed.is_empty() {
+    if trimmed_insert_sizes.is_empty() {
         return Ok((0.0, 0.0));
     }
 
-    let mean = trimmed.iter().sum::<f64>() / trimmed.len() as f64;
-    let var = trimmed
+    let mean = trimmed_insert_sizes.iter().sum::<f64>() / trimmed_insert_sizes.len() as f64;
+    let var = trimmed_insert_sizes
         .iter()
         .map(|x| {
             let d = *x - mean;
             d * d
         })
         .sum::<f64>()
-        / trimmed.len() as f64;
+        / trimmed_insert_sizes.len() as f64;
     let sd = var.sqrt();
 
     Ok((mean, sd))

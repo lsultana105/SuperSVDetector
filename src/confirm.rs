@@ -3,9 +3,11 @@ use rust_htslib::bam;
 use rust_htslib::bam::record::Cigar;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-
 use crate::hotspot::Hotspot;
 use crate::suffix::SuffixWorkspace;
+
+// Confirmation applies stricter filtering and breakpoint clustering than
+// hotspot discovery, so false positives are reduced at this stage.
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SvCall {
@@ -27,11 +29,6 @@ pub struct SvCall {
 // ------------------------
 
 fn median_u64(v: &mut Vec<u64>) -> u64 {
-    v.sort_unstable();
-    v[v.len() / 2]
-}
-
-fn median_isize(v: &mut Vec<isize>) -> isize {
     v.sort_unstable();
     v[v.len() / 2]
 }
@@ -69,7 +66,7 @@ fn trimmed_spread(sorted: &[u64], trim_frac: f64) -> u64 {
 // ------------------------
 
 fn confirm_pe_deletion_from_support(
-    support: &[&bam::Record],
+    support_reads: &[&bam::Record],
     insert_mean: f64,
     insert_sd: f64,
 ) -> Option<(u64, u64, usize)> {
@@ -125,7 +122,7 @@ fn confirm_pe_deletion_from_support(
     let mut right_bps: Vec<u64> = Vec::new();
     let mut seen_qname: HashSet<Vec<u8>> = HashSet::new();
 
-    for r in support {
+    for r in support_reads {
         if r.is_secondary() || r.is_duplicate() {
             continue;
         }
@@ -200,33 +197,33 @@ fn confirm_pe_deletion_from_support(
     let (l_lo, l_hi) = densest_window(&left_bps, CLUSTER_WIN_BP);
     let (r_lo, r_hi) = densest_window(&right_bps, CLUSTER_WIN_BP);
 
-    let mut left_c = left_bps[l_lo..l_hi].to_vec();
-    let mut right_c = right_bps[r_lo..r_hi].to_vec();
+    let mut left_cluster = left_bps[l_lo..l_hi].to_vec();
+    let mut right_cluster = right_bps[r_lo..r_hi].to_vec();
 
-    if left_c.len() < MIN_PE_SUPPORT || right_c.len() < MIN_PE_SUPPORT {
+    if left_cluster.len() < MIN_PE_SUPPORT || right_cluster.len() < MIN_PE_SUPPORT {
         return None;
     }
 
-    left_c.sort_unstable();
-    right_c.sort_unstable();
+    left_cluster.sort_unstable();
+    right_cluster.sort_unstable();
 
     // robust spread gate (trimmed)
-    let left_spread = trimmed_spread(&left_c, TRIM_FRAC);
-    let right_spread = trimmed_spread(&right_c, TRIM_FRAC);
+    let left_spread = trimmed_spread(&left_cluster, TRIM_FRAC);
+    let right_spread = trimmed_spread(&right_cluster, TRIM_FRAC);
     if left_spread > MAX_BP_SPREAD || right_spread > MAX_BP_SPREAD {
         return None;
     }
 
-    let start0 = median_u64(&mut left_c);
-    let end0 = median_u64(&mut right_c);
+    let start_pos0 = median_u64(&mut left_cluster);
+    let end_pos0 = median_u64(&mut right_cluster);
 
-    if end0 <= start0 || (end0 - start0) < MIN_DEL_BP {
+    if end_pos0 <= start_pos0 || (end_pos0 - start_pos0) < MIN_DEL_BP {
         return None;
     }
 
     // score = cluster support used (min of both sides)
-    let score = left_c.len().min(right_c.len());
-    Some((start0, end0, score))
+    let score = left_cluster.len().min(right_cluster.len());
+    Some((start_pos0, end_pos0, score))
 }
 
 
@@ -259,10 +256,10 @@ pub fn confirm_breakpoint(
     // Gather overlapping reads (or mate overlaps) into support
     let mut support: Vec<&bam::Record> = Vec::new();
     for r in reads.iter() {
-        let pos0 = r.pos().max(0) as u64;
-        let end0 = pos0 + ref_consumed_len(&r.cigar());
+        let breakpoint_pos0 = r.pos().max(0) as u64;
+        let end0 = breakpoint_pos0 + ref_consumed_len(&r.cigar());
 
-        let read_overlaps = end0 > g_start0 && pos0 < g_end0;
+        let read_overlaps = end0 > g_start0 && breakpoint_pos0 < g_end0;
 
         let mate_overlaps = r.is_paired()
             && !r.is_mate_unmapped()
@@ -306,8 +303,8 @@ pub fn confirm_breakpoint(
         const MIN_BND_SUPPORT: usize = 3;
         const MAX_POS_SPREAD: u64 = 500;
 
-        let mut a_pos: Vec<u64> = Vec::new();
-        let mut b_pos: Vec<u64> = Vec::new();
+        let mut local_positions: Vec<u64> = Vec::new();
+        let mut mate_positions: Vec<u64> = Vec::new();
         let mut mate_chrom_name: Option<String> = None;
         let mut seen_qname: HashSet<Vec<u8>> = HashSet::new();
 
@@ -332,8 +329,8 @@ pub fn confirm_breakpoint(
 
             let rpos0 = r.pos().max(0) as u64;
             let mpos0 = r.mpos().max(0) as u64;
-            a_pos.push(rpos0);
-            b_pos.push(mpos0);
+            local_positions.push(rpos0);
+            mate_positions.push(mpos0);
 
             let mtid = r.mtid();
             if mtid >= 0 {
@@ -344,32 +341,32 @@ pub fn confirm_breakpoint(
             }
         }
 
-        if a_pos.len() < MIN_BND_SUPPORT || mate_chrom_name.is_none() {
+        if local_positions.len() < MIN_BND_SUPPORT || mate_chrom_name.is_none() {
             return Ok(None);
         }
 
-        a_pos.sort_unstable();
-        b_pos.sort_unstable();
+        local_positions.sort_unstable();
+        mate_positions.sort_unstable();
 
-        let a_spread = a_pos[a_pos.len() - 1] - a_pos[0];
-        let b_spread = b_pos[b_pos.len() - 1] - b_pos[0];
+        let a_spread = local_positions[local_positions.len() - 1] - local_positions[0];
+        let b_spread = mate_positions[mate_positions.len() - 1] - mate_positions[0];
         if a_spread > MAX_POS_SPREAD || b_spread > MAX_POS_SPREAD {
             return Ok(None);
         }
 
-        let pos0 = median_u64(&mut a_pos);
-        let mate0 = median_u64(&mut b_pos);
+        let breakpoint_pos0 = median_u64(&mut local_positions);
+        let mate_breakpoint0 = median_u64(&mut mate_positions);
 
         return Ok(Some(SvCall {
             chrom: chrom.into(),
-            pos: pos0 + 1,
-            end: pos0 + 1,
+            pos: breakpoint_pos0 + 1,
+            end: breakpoint_pos0 + 1,
             svtype: "BND".into(),
             len: 0,
-            score: a_pos.len() as i32,
+            score: local_positions.len() as i32,
             reason: "PE".into(),
             mate_chrom: mate_chrom_name,
-            mate_pos: Some(mate0 + 1),
+            mate_pos: Some(mate_breakpoint0 + 1),
         }));
     }
 

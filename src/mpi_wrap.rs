@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Result};
 use mpi::traits::*;
 use serde::{Deserialize, Serialize};
-
 use crate::bins::Bin;
 use crate::io_utils::WorkerIo;
-use crate::process_bin::{process_bin_with_readers, CallConfig};
+use crate::process_bin::{process_bin, CallConfig};
 use crate::vcfout;
 
+
+// Workers keep BAM and FASTA readers open across bins to avoid repeated I/O setup.
 const TAG_WORK: i32 = 1;
 const TAG_STOP: i32 = 2;
 const TAG_DONE: i32 = 3;
@@ -135,7 +136,7 @@ fn run_worker<C: mpi::topology::Communicator>(
             TAG_WORK => {
                 let bin: Bin = serde_json::from_slice(&msg)?;
 
-                match process_bin_with_readers(&mut io, &bin, &cfg) {
+                match process_bin(&mut io, &bin, &cfg) {
                     Ok(calls) => {
                         vcfout::write_bin_json(&cfg.out_dir, &bin, &calls)?;
 

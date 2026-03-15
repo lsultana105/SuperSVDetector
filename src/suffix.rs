@@ -83,14 +83,6 @@ impl SuffixWorkspace {
         }
         lo
     }
-
-    /// Check if the suffix starting at `pos` has `pat` as a prefix.
-    #[inline]
-    fn suffix_has_prefix(&self, pos: usize, pat: &[u8]) -> bool {
-        let suf = &self.text[pos..];
-        if suf.len() < pat.len() { return false; }
-        suf[..pat.len()] == *pat
-    }
 }
 
 /// Lexicographic comparison of `s` against prefix `pat`.

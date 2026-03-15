@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
-
 use rust_htslib::bam;
 use rust_htslib::bam::record::Seq;
-
 use crate::hotspot::Hotspot;
 
+
+// Hotspot discovery is designed to be sensitive rather than final.
+// Candidate evidence is collected here and validated later in confirm.rs.
 pub struct MinimizerIndex {
     pub map: HashMap<u64, Vec<usize>>,
 }
@@ -17,7 +18,7 @@ impl MinimizerIndex {
             return Self { map };
         }
 
-        let enc = |b: u8| match b {
+        let encode_base = |b: u8| match b {
             b'A' | b'a' => Some(0u64),
             b'C' | b'c' => Some(1),
             b'G' | b'g' => Some(2),
@@ -26,27 +27,27 @@ impl MinimizerIndex {
         };
 
         for i in 0..=ref_window.len() - w {
-            let mut best: Option<(u64, usize)> = None;
+            let mut best_minimizer: Option<(u64, usize)> = None;
 
             for j in i..=i + w - k {
-                let mut val = 0u64;
-                let mut ok = true;
+                let mut encoded_kmer = 0u64;
+                let mut is_valid = true;
 
                 for t in 0..k {
-                    if let Some(x) = enc(ref_window[j + t]) {
-                        val = (val << 2) | x;
+                    if let Some(x) = encode_base(ref_window[j + t]) {
+                        encoded_kmer = (encoded_kmer << 2) | x;
                     } else {
-                        ok = false;
+                        is_valid = false;
                         break;
                     }
                 }
 
-                if ok && best.map_or(true, |(v, _)| val < v) {
-                    best = Some((val, j));
+                if is_valid && best_minimizer.map_or(true, |(v, _)| encoded_kmer < v) {
+                    best_minimizer = Some((encoded_kmer, j));
                 }
             }
 
-            if let Some((val, jpos)) = best {
+            if let Some((val, jpos)) = best_minimizer {
                 map.entry(val).or_default().push(jpos);
             }
         }
@@ -67,12 +68,12 @@ fn has_sa_tag(r: &bam::Record) -> bool {
     r.aux(b"SA").is_ok()
 }
 
-fn collapse_hotspots(mut raw: Vec<(usize, String, usize)>) -> Vec<Hotspot> {
-    if raw.is_empty() {
+fn collapse_hotspots(mut raw_hotspots: Vec<(usize, String, usize)>) -> Vec<Hotspot> {
+    if raw_hotspots.is_empty() {
         return Vec::new();
     }
 
-    raw.sort_by(|a, b| {
+    raw_hotspots.sort_by(|a, b| {
         let ord = a.1.cmp(&b.1);
         if ord == std::cmp::Ordering::Equal {
             a.0.cmp(&b.0)
@@ -83,13 +84,13 @@ fn collapse_hotspots(mut raw: Vec<(usize, String, usize)>) -> Vec<Hotspot> {
 
     let mut out: Vec<Hotspot> = Vec::new();
 
-    let mut cur_pos = raw[0].0;
-    let mut cur_reason = raw[0].1.clone();
-    let mut cur_support = raw[0].2;
+    let mut cur_pos = raw_hotspots[0].0;
+    let mut cur_reason = raw_hotspots[0].1.clone();
+    let mut cur_support = raw_hotspots[0].2;
 
     const MERGE_WIN: usize = 300;
 
-    for (pos, reason, support) in raw.into_iter().skip(1) {
+    for (pos, reason, support) in raw_hotspots.into_iter().skip(1) {
         if reason == cur_reason && pos.abs_diff(cur_pos) <= MERGE_WIN {
             if support > cur_support {
                 cur_pos = pos;
@@ -129,9 +130,6 @@ pub fn discover_hotspots(
 
     const MIN_MAPQ: u8 = 20;
     const Z_CUTOFF: f64 = 3.0;
-
-    // Make deletion hotspot generation permissive again.
-    // Let confirm.rs be the stricter stage.
     const MIN_DEL_PE_SUPPORT: usize = 2;
     const MIN_BND_SUPPORT: usize = 3;
     const MIN_SR_SUPPORT: usize = 3;
@@ -140,8 +138,6 @@ pub fn discover_hotspots(
     const WIN_BND: usize = 500;
     const WIN_SR: usize = 100;
     const WIN_RARE: usize = 200;
-
-    const MIN_RARE_SUPPORT: usize = 999999;
 
     let min_clip_sr: u32 = 20;
 
@@ -241,34 +237,12 @@ pub fn discover_hotspots(
             }
         }
 
-        // Keep the stricter SA/supplementary requirement for SR evidence
         if clip_ok && (has_sa_tag(r) || r.is_supplementary()) {
             seen_sr.insert(qn);
             let local = (gpos0 - bin_start) as usize;
             let b = (local / WIN_SR) * WIN_SR;
             evidence.entry(b).or_default().soft_clip_sr += 1;
             continue;
-        }
-
-        // Rare k-mer evidence (disabled by default)
-        if MIN_RARE_SUPPORT != 999999 && r.seq_len() >= k {
-            let seq = r.seq();
-            let (mut rare, mut total) = (0usize, 0usize);
-
-            for i in (0..=seq.len() - k).step_by(5) {
-                if let Some(v) = encode_kmer(&seq, i, k) {
-                    total += 1;
-                    if mindex.map.get(&v).is_none() {
-                        rare += 1;
-                    }
-                }
-            }
-
-            if total >= 5 && rare * 2 > total {
-                let local = (gpos0 - bin_start) as usize;
-                let b = (local / WIN_RARE) * WIN_RARE;
-                evidence.entry(b).or_default().rare_kmer += 1;
-            }
         }
     }
 
@@ -283,9 +257,6 @@ pub fn discover_hotspots(
         }
         if c.soft_clip_sr >= MIN_SR_SUPPORT {
             raw.push((bin, "soft_clip_sr".into(), c.soft_clip_sr));
-        }
-        if c.rare_kmer >= MIN_RARE_SUPPORT {
-            raw.push((bin, "rare_kmer".into(), c.rare_kmer));
         }
     }
 

@@ -3,7 +3,6 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use anyhow::{bail, Context, Result};
 use rust_htslib::bcf::{self, header::Header, Writer};
 use serde_json::Deserializer;
-
 use crate::cluster::cluster_calls;
 use crate::confirm::SvCall;
 
@@ -75,7 +74,7 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
         }
     }
 
-    // Cluster nearby calls (you can tune radius later)
+    // Cluster nearby calls
     let calls = cluster_calls(calls, 500);
 
     // 2) Header
@@ -83,17 +82,14 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
     hdr.push_record(b"##fileformat=VCFv4.2");
     hdr.push_record(b"##source=SuperSVDetector");
     hdr.push_record(format!("##reference={}", ref_fa).as_bytes());
-
     hdr.push_record(b"##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">");
     hdr.push_record(b"##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length of SV (negative for deletions)\">");
     hdr.push_record(b"##INFO=<ID=END,Number=1,Type=Integer,Description=\"End coordinate of the variant\">");
     hdr.push_record(b"##INFO=<ID=SCORE,Number=1,Type=Integer,Description=\"Support/heuristic score\">");
     hdr.push_record(b"##INFO=<ID=REASON,Number=1,Type=String,Description=\"Evidence source\">");
-
     // for BND debug/analysis
     hdr.push_record(b"##INFO=<ID=MATECHR,Number=1,Type=String,Description=\"Mate chromosome for BND\">");
     hdr.push_record(b"##INFO=<ID=MATEPOS,Number=1,Type=Integer,Description=\"Mate position (1-based) for BND\">");
-
     add_contigs_from_fai(&mut hdr, ref_fa)?;
     hdr.push_record(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO");
 
@@ -116,10 +112,7 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
 
         let mut rec = w.empty_record();
         rec.set_rid(Some(rid));
-
-        // c.pos is 1-based in SvCall, but bcf expects 0-based.
         rec.set_pos((c.pos.saturating_sub(1)) as i64);
-
         rec.set_id(format!("svx_{}", i).as_bytes())?;
         rec.set_qual(0.0);
 
@@ -149,7 +142,6 @@ pub fn merge_json_to_vcf(outdir: &str, vcf_path: &str, ref_fa: &str) -> Result<(
             continue;
         }
         rec.push_info_integer(b"END", &[c.end as i32])?;
-
         rec.push_info_integer(b"SCORE", &[c.score])?;
         rec.push_info_string(b"REASON", &[c.reason.as_bytes()])?;
 

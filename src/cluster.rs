@@ -10,44 +10,44 @@ pub fn cluster_calls(mut calls: Vec<SvCall>, radius: u64) -> Vec<SvCall> {
     });
 
     let mut out: Vec<SvCall> = Vec::new();
-    let mut cur: Option<SvCall> = None;
+    let mut current_clustered_call: Option<SvCall> = None;
 
-    for c in calls.into_iter() {
-        if let Some(ref mut x) = cur {
-            let same = x.chrom == c.chrom && x.svtype == c.svtype;
-            let pos_close = x.pos.abs_diff(c.pos) <= radius;
-            let end_close = x.end.abs_diff(c.end) <= radius;
+    for call in calls.into_iter() {
+        if let Some(ref mut current_call) = current_clustered_call {
+            let same = current_call.chrom == call.chrom && current_call.svtype == call.svtype;
+            let pos_close = current_call.pos.abs_diff(call.pos) <= radius;
+            let end_close = current_call.end.abs_diff(call.end) <= radius;
 
             if same && pos_close && end_close {
                 // Lumpy-ish merge behaviour: expand interval rather than averaging
-                x.pos = x.pos.min(c.pos);
-                x.end = x.end.max(c.end);
+                current_call.pos = current_call.pos.min(call.pos);
+                current_call.end = current_call.end.max(call.end);
 
                 // support score: keep max
-                x.score = x.score.max(c.score);
+                current_call.score = current_call.score.max(call.score);
 
                 // length: recompute for DEL if possible
-                if x.svtype == "DEL" {
-                    let len = x.end.saturating_sub(x.pos) as isize;
-                    x.len = -(len as isize);
+                if current_call.svtype == "DEL" {
+                    let len = current_call.end.saturating_sub(current_call.pos) as isize;
+                    current_call.len = -(len as isize);
                 }
 
                 // merge reasons
-                if !x.reason.contains(&c.reason) {
-                    if !x.reason.is_empty() {
-                        x.reason.push(',');
+                if !current_call.reason.contains(&call.reason) {
+                    if !current_call.reason.is_empty() {
+                        current_call.reason.push(',');
                     }
-                    x.reason.push_str(&c.reason);
+                    current_call.reason.push_str(&call.reason);
                 }
                 continue;
             }
 
-            out.push(cur.take().unwrap());
+            out.push(current_clustered_call.take().unwrap());
         }
-        cur = Some(c);
+        current_clustered_call = Some(call);
     }
 
-    if let Some(x) = cur {
+    if let Some(x) = current_clustered_call {
         out.push(x);
     }
     out

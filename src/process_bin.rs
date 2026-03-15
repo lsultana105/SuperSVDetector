@@ -12,6 +12,9 @@ use crate::io_utils::{
 use crate::kmer::{discover_hotspots, MinimizerIndex};
 use crate::suffix::SuffixWorkspace;
 
+// Border-adjacent hotspots trigger bin expansion so that events spanning
+// bin boundaries are confirmed using a consistent reference window and read set.
+
 #[derive(Clone, Debug)]
 pub struct CallConfig {
     pub band: usize,
@@ -57,7 +60,7 @@ fn collapse_nearby_hotspots(mut hotspots: Vec<Hotspot>) -> Vec<Hotspot> {
     out
 }
 
-fn same_call(a: &SvCall, b: &SvCall) -> bool {
+fn calls_match(a: &SvCall, b: &SvCall) -> bool {
     if a.chrom != b.chrom || a.svtype != b.svtype {
         return false;
     }
@@ -78,7 +81,10 @@ fn same_call(a: &SvCall, b: &SvCall) -> bool {
     }
 }
 
-fn dedup_calls(mut calls: Vec<SvCall>) -> Vec<SvCall> {
+
+// Final per-bin deduplication removes near-identical calls that may arise
+// from multiple nearby hotspots producing the same event.
+fn deduplicate_calls(mut calls: Vec<SvCall>) -> Vec<SvCall> {
     if calls.is_empty() {
         return calls;
     }
@@ -103,7 +109,7 @@ fn dedup_calls(mut calls: Vec<SvCall>) -> Vec<SvCall> {
 
     for call in calls {
         if let Some(last) = out.last_mut() {
-            if same_call(last, &call) {
+            if calls_match(last, &call) {
                 if call.score > last.score {
                     *last = call;
                 }
@@ -116,7 +122,7 @@ fn dedup_calls(mut calls: Vec<SvCall>) -> Vec<SvCall> {
     out
 }
 
-pub fn process_bin_with_readers(
+pub fn process_bin(
     io: &mut WorkerIo,
     bin: &Bin,
     cfg: &CallConfig,
@@ -144,7 +150,7 @@ pub fn process_bin_with_readers(
     };
 
     // 1) Initial fetch
-    let ref_window0 = fetch_reference_window_with_reader(
+    let initial_ref_window = fetch_reference_window_with_reader(
         &mut io.fasta,
         chrom,
         bin.start,
@@ -152,7 +158,7 @@ pub fn process_bin_with_readers(
     )
         .with_context(|| format!("failed reference fetch for {}:{}-{}", chrom, bin.start, bin.end))?;
 
-    let reads0 = fetch_reads_overlapping_with_reader(io, chrom, bin.start, bin.end)
+    let initial_reads = fetch_reads_overlapping_with_reader(io, chrom, bin.start, bin.end)
         .with_context(|| format!("failed BAM fetch for {}:{}-{}", chrom, bin.start, bin.end))?;
 
     if debug_this_bin {
@@ -161,23 +167,23 @@ pub fn process_bin_with_readers(
             chrom,
             bin.start,
             bin.end,
-            reads0.len(),
+            initial_reads.len(),
             cfg.insert_mean,
             cfg.insert_sd
         );
     }
 
     // 2) Discover hotspots once on the original bin
-    let mindex0 = MinimizerIndex::build(&ref_window0, cfg.k, cfg.w);
-    let hotspots0 = discover_hotspots(
-        &reads0,
-        &mindex0,
+    let initial_minimizer_index = MinimizerIndex::build(&initial_ref_window, cfg.k, cfg.w);
+    let initial_hotspots = discover_hotspots(
+        &initial_reads,
+        &initial_minimizer_index,
         cfg.k,
         bin.start,
         cfg.insert_mean,
         cfg.insert_sd,
     );
-    let mut hotspots = collapse_nearby_hotspots(hotspots0);
+    let mut hotspots = collapse_nearby_hotspots(initial_hotspots);
 
     if debug_this_bin {
         let mut d = 0usize;
@@ -201,7 +207,7 @@ pub fn process_bin_with_readers(
     }
 
     // 3) Decide whether expansion is needed
-    let needs_expansion = hotspot_near_boundary(&hotspots, ref_window0.len(), cfg.edge_margin);
+    let needs_expansion = hotspot_near_boundary(&hotspots, initial_ref_window.len(), cfg.edge_margin);
 
     // 4) Prepare final reference / reads for confirmation
     let (final_ref_window, final_bin_start, final_reads) = if needs_expansion {
@@ -219,7 +225,7 @@ pub fn process_bin_with_readers(
             );
         }
 
-        let extended_ref = fetch_reference_window_with_reader(
+        let expanded_ref_window = fetch_reference_window_with_reader(
             &mut io.fasta,
             chrom,
             new_start,
@@ -234,21 +240,21 @@ pub fn process_bin_with_readers(
             }
         }
 
-        let reads1 = fetch_reads_overlapping_with_reader(io, chrom, new_start, new_end)
+        let expanded_reads = fetch_reads_overlapping_with_reader(io, chrom, new_start, new_end)
             .with_context(|| format!("failed expanded BAM fetch for {}:{}-{}", chrom, new_start, new_end))?;
 
         if debug_this_bin {
             log::warn!(
                 "[BIN] expanded ref_len={} reads={} hotspots_preserved={}",
-                extended_ref.len(),
-                reads1.len(),
+                expanded_ref_window.len(),
+                expanded_reads.len(),
                 hotspots.len()
             );
         }
 
-        (extended_ref, new_start, reads1)
+        (expanded_ref_window, new_start, expanded_reads)
     } else {
-        (ref_window0, bin.start, reads0)
+        (initial_ref_window, bin.start, initial_reads)
     };
 
     let sfx = SuffixWorkspace::build(&final_ref_window);
@@ -274,7 +280,7 @@ pub fn process_bin_with_readers(
         }
     }
 
-    let calls = dedup_calls(calls);
+    let calls = deduplicate_calls(calls);
 
     if debug_this_bin {
         log::warn!("[BIN] calls_after_dedup={}", calls.len());

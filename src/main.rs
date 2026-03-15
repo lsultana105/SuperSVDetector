@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use log::*;
 use rayon::prelude::*;
 use std::time::Instant;
+use crate::io_utils::WorkerIo;
+use crate::process_bin::{process_bin, CallConfig};
 
 mod bins;
 mod io_utils;
@@ -13,12 +15,12 @@ mod mpi_wrap;
 mod vcfout;
 mod hotspot;
 mod cluster;
-mod merge_vcf;
 mod process_bin;
 
-use crate::io_utils::WorkerIo;
-use crate::process_bin::{process_bin_with_readers, CallConfig};
-
+// The pipeline is split into three stages:
+// 1. index reference bins
+// 2. call SV candidates per bin
+// 3. merge per-bin calls into a final VCF
 #[derive(Parser, Debug)]
 #[command(
     name = "SuperSVDetector",
@@ -139,7 +141,7 @@ fn main() -> Result<()> {
                 bins.into_par_iter().for_each_init(
                     || WorkerIo::new(&bam, &ref_fa).expect("failed to initialize WorkerIo"),
                     |io, bin| {
-                        match process_bin_with_readers(io, &bin, &cfg) {
+                        match process_bin(io, &bin, &cfg) {
                             Ok(calls) => {
                                 if let Err(e) = vcfout::write_bin_json(&outdir, &bin, &calls) {
                                     error!(
