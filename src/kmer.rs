@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
+
 use rust_htslib::bam;
-use rust_htslib::bam::record::{Cigar, Seq};
+use rust_htslib::bam::record::Seq;
 
 use crate::hotspot::Hotspot;
-use rust_htslib::bam::record::Aux;
 
 pub struct MinimizerIndex {
     pub map: HashMap<u64, Vec<usize>>,
@@ -63,6 +63,58 @@ struct EvidenceCounts {
     rare_kmer: usize,
 }
 
+fn has_sa_tag(r: &bam::Record) -> bool {
+    r.aux(b"SA").is_ok()
+}
+
+fn collapse_hotspots(mut raw: Vec<(usize, String, usize)>) -> Vec<Hotspot> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+
+    raw.sort_by(|a, b| {
+        let ord = a.1.cmp(&b.1);
+        if ord == std::cmp::Ordering::Equal {
+            a.0.cmp(&b.0)
+        } else {
+            ord
+        }
+    });
+
+    let mut out: Vec<Hotspot> = Vec::new();
+
+    let mut cur_pos = raw[0].0;
+    let mut cur_reason = raw[0].1.clone();
+    let mut cur_support = raw[0].2;
+
+    const MERGE_WIN: usize = 300;
+
+    for (pos, reason, support) in raw.into_iter().skip(1) {
+        if reason == cur_reason && pos.abs_diff(cur_pos) <= MERGE_WIN {
+            if support > cur_support {
+                cur_pos = pos;
+                cur_support = support;
+            }
+        } else {
+            out.push(Hotspot {
+                local_pos: cur_pos,
+                reason: cur_reason.clone(),
+            });
+            cur_pos = pos;
+            cur_reason = reason;
+            cur_support = support;
+        }
+    }
+
+    out.push(Hotspot {
+        local_pos: cur_pos,
+        reason: cur_reason,
+    });
+
+    out.sort_by_key(|h| h.local_pos);
+    out
+}
+
 pub fn discover_hotspots(
     reads: &[bam::Record],
     mindex: &MinimizerIndex,
@@ -72,14 +124,14 @@ pub fn discover_hotspots(
     insert_sd: f64,
 ) -> Vec<Hotspot> {
     use rust_htslib::bam::record::Cigar;
-    use std::collections::{HashMap, HashSet};
 
     let mut evidence: HashMap<usize, EvidenceCounts> = HashMap::new();
 
     const MIN_MAPQ: u8 = 20;
-
     const Z_CUTOFF: f64 = 3.0;
 
+    // Make deletion hotspot generation permissive again.
+    // Let confirm.rs be the stricter stage.
     const MIN_DEL_PE_SUPPORT: usize = 2;
     const MIN_BND_SUPPORT: usize = 3;
     const MIN_SR_SUPPORT: usize = 3;
@@ -101,6 +153,7 @@ pub fn discover_hotspots(
 
     let mut seen_del_pe: HashSet<Vec<u8>> = HashSet::new();
     let mut seen_bnd_pe: HashSet<Vec<u8>> = HashSet::new();
+    let mut seen_sr: HashSet<Vec<u8>> = HashSet::new();
 
     for r in reads {
         if r.is_secondary() || r.is_duplicate() {
@@ -114,19 +167,20 @@ pub fn discover_hotspots(
         if gpos0 < bin_start {
             continue;
         }
-        let local = (gpos0 - bin_start) as usize;
 
         if r.is_paired()
             && !r.is_unmapped()
             && !r.is_mate_unmapped()
             && !r.is_supplementary()
         {
-            // inter-chrom => BND-ish
+            // Inter-chromosomal pairs -> BND-like evidence
             if r.tid() != r.mtid() {
                 let qn = r.qname().to_vec();
                 if !seen_bnd_pe.insert(qn) {
                     continue;
                 }
+
+                let local = (gpos0 - bin_start) as usize;
                 let b = (local / WIN_BND) * WIN_BND;
                 evidence.entry(b).or_default().bnd_pe += 1;
                 continue;
@@ -165,30 +219,38 @@ pub fn discover_hotspots(
             }
         }
 
-        // soft clip SR
+        let qn = r.qname().to_vec();
+        if seen_sr.contains(&qn) {
+            continue;
+        }
+
+        // Soft-clipped split-read-like evidence
         let cig = r.cigar();
-        let mut ok = false;
+        let mut clip_ok = false;
 
         if let Some(Cigar::SoftClip(n)) = cig.iter().next() {
             if *n >= min_clip_sr {
-                ok = true;
+                clip_ok = true;
             }
         }
-        if !ok {
+        if !clip_ok {
             if let Some(Cigar::SoftClip(n)) = cig.iter().last() {
                 if *n >= min_clip_sr {
-                    ok = true;
+                    clip_ok = true;
                 }
             }
         }
 
-        if ok {
+        // Keep the stricter SA/supplementary requirement for SR evidence
+        if clip_ok && (has_sa_tag(r) || r.is_supplementary()) {
+            seen_sr.insert(qn);
+            let local = (gpos0 - bin_start) as usize;
             let b = (local / WIN_SR) * WIN_SR;
             evidence.entry(b).or_default().soft_clip_sr += 1;
             continue;
         }
 
-        // rare kmer (disabled by default)
+        // Rare k-mer evidence (disabled by default)
         if MIN_RARE_SUPPORT != 999999 && r.seq_len() >= k {
             let seq = r.seq();
             let (mut rare, mut total) = (0usize, 0usize);
@@ -203,42 +265,31 @@ pub fn discover_hotspots(
             }
 
             if total >= 5 && rare * 2 > total {
+                let local = (gpos0 - bin_start) as usize;
                 let b = (local / WIN_RARE) * WIN_RARE;
                 evidence.entry(b).or_default().rare_kmer += 1;
             }
         }
     }
 
-    let mut out: Vec<Hotspot> = Vec::new();
+    let mut raw: Vec<(usize, String, usize)> = Vec::new();
+
     for (bin, c) in evidence.into_iter() {
         if c.discordant_del >= MIN_DEL_PE_SUPPORT {
-            out.push(Hotspot {
-                local_pos: bin,
-                reason: "discordant_del".into(),
-            });
+            raw.push((bin, "discordant_del".into(), c.discordant_del));
         }
         if c.bnd_pe >= MIN_BND_SUPPORT {
-            out.push(Hotspot {
-                local_pos: bin,
-                reason: "bnd_pe".into(),
-            });
+            raw.push((bin, "bnd_pe".into(), c.bnd_pe));
         }
         if c.soft_clip_sr >= MIN_SR_SUPPORT {
-            out.push(Hotspot {
-                local_pos: bin,
-                reason: "soft_clip_sr".into(),
-            });
+            raw.push((bin, "soft_clip_sr".into(), c.soft_clip_sr));
         }
         if c.rare_kmer >= MIN_RARE_SUPPORT {
-            out.push(Hotspot {
-                local_pos: bin,
-                reason: "rare_kmer".into(),
-            });
+            raw.push((bin, "rare_kmer".into(), c.rare_kmer));
         }
     }
 
-    out.sort_by_key(|h| h.local_pos);
-    out
+    collapse_hotspots(raw)
 }
 
 fn encode_kmer(seq: &Seq, i: usize, k: usize) -> Option<u64> {

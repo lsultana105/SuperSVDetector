@@ -24,6 +24,98 @@ pub struct CallConfig {
     pub ref_fa: String,
 }
 
+fn collapse_nearby_hotspots(mut hotspots: Vec<Hotspot>) -> Vec<Hotspot> {
+    if hotspots.is_empty() {
+        return hotspots;
+    }
+
+    hotspots.sort_by(|a, b| {
+        let ord = a.reason.cmp(&b.reason);
+        if ord == std::cmp::Ordering::Equal {
+            a.local_pos.cmp(&b.local_pos)
+        } else {
+            ord
+        }
+    });
+
+    let mut out = Vec::new();
+    let mut cur = hotspots[0].clone();
+
+    const HOTSPOT_MERGE_WIN: usize = 300;
+
+    for hs in hotspots.into_iter().skip(1) {
+        if hs.reason == cur.reason && hs.local_pos.abs_diff(cur.local_pos) <= HOTSPOT_MERGE_WIN {
+            cur.local_pos = (cur.local_pos + hs.local_pos) / 2;
+        } else {
+            out.push(cur);
+            cur = hs;
+        }
+    }
+
+    out.push(cur);
+    out.sort_by_key(|h| h.local_pos);
+    out
+}
+
+fn same_call(a: &SvCall, b: &SvCall) -> bool {
+    if a.chrom != b.chrom || a.svtype != b.svtype {
+        return false;
+    }
+
+    match a.svtype.as_str() {
+        "DEL" => a.pos.abs_diff(b.pos) <= 100 && a.end.abs_diff(b.end) <= 100,
+        "INS" => a.pos.abs_diff(b.pos) <= 50 && (a.len - b.len).abs() <= 50,
+        "BND" => {
+            a.pos.abs_diff(b.pos) <= 100
+                && a.mate_chrom == b.mate_chrom
+                && match (a.mate_pos, b.mate_pos) {
+                (Some(x), Some(y)) => x.abs_diff(y) <= 100,
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        _ => a.pos.abs_diff(b.pos) <= 100 && a.end.abs_diff(b.end) <= 100,
+    }
+}
+
+fn dedup_calls(mut calls: Vec<SvCall>) -> Vec<SvCall> {
+    if calls.is_empty() {
+        return calls;
+    }
+
+    calls.sort_by(|a, b| {
+        let ord = a.chrom.cmp(&b.chrom);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+        let ord = a.svtype.cmp(&b.svtype);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+        let ord = a.pos.cmp(&b.pos);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+        a.end.cmp(&b.end)
+    });
+
+    let mut out: Vec<SvCall> = Vec::new();
+
+    for call in calls {
+        if let Some(last) = out.last_mut() {
+            if same_call(last, &call) {
+                if call.score > last.score {
+                    *last = call;
+                }
+                continue;
+            }
+        }
+        out.push(call);
+    }
+
+    out
+}
+
 pub fn process_bin_with_readers(
     io: &mut WorkerIo,
     bin: &Bin,
@@ -51,7 +143,7 @@ pub fn process_bin_with_readers(
         true
     };
 
-    // 1) initial fetch
+    // 1) Initial fetch
     let ref_window0 = fetch_reference_window_with_reader(
         &mut io.fasta,
         chrom,
@@ -66,15 +158,18 @@ pub fn process_bin_with_readers(
     if debug_this_bin {
         log::warn!(
             "[BIN] {}:{}-{} reads={} insert_mean={} insert_sd={}",
-            chrom, bin.start, bin.end, reads0.len(), cfg.insert_mean, cfg.insert_sd
+            chrom,
+            bin.start,
+            bin.end,
+            reads0.len(),
+            cfg.insert_mean,
+            cfg.insert_sd
         );
     }
 
-    let mut sfx = SuffixWorkspace::build(&ref_window0);
-
-    // 2) hotspot discovery
+    // 2) Discover hotspots once on the original bin
     let mindex0 = MinimizerIndex::build(&ref_window0, cfg.k, cfg.w);
-    let mut hotspots: Vec<Hotspot> = discover_hotspots(
+    let hotspots0 = discover_hotspots(
         &reads0,
         &mindex0,
         cfg.k,
@@ -82,6 +177,7 @@ pub fn process_bin_with_readers(
         cfg.insert_mean,
         cfg.insert_sd,
     );
+    let mut hotspots = collapse_nearby_hotspots(hotspots0);
 
     if debug_this_bin {
         let mut d = 0usize;
@@ -96,7 +192,7 @@ pub fn process_bin_with_readers(
             }
         }
         log::warn!(
-            "[BIN] hotspots total={} discordant_del={} bnd_pe={} soft_clip_sr={}",
+            "[BIN] hotspots after collapse={} discordant_del={} bnd_pe={} soft_clip_sr={}",
             hotspots.len(),
             d,
             b,
@@ -104,9 +200,10 @@ pub fn process_bin_with_readers(
         );
     }
 
-    // 3) optional boundary expansion
+    // 3) Decide whether expansion is needed
     let needs_expansion = hotspot_near_boundary(&hotspots, ref_window0.len(), cfg.edge_margin);
 
+    // 4) Prepare final reference / reads for confirmation
     let (final_ref_window, final_bin_start, final_reads) = if needs_expansion {
         let contig_len = get_contig_len_from_fai(&cfg.ref_fa, chrom)?;
         let new_start = bin.start.saturating_sub(cfg.edge_margin as u64);
@@ -115,7 +212,10 @@ pub fn process_bin_with_readers(
         if debug_this_bin {
             log::warn!(
                 "[BIN] expanding: old=[{}-{}] new=[{}-{}]",
-                bin.start, bin.end, new_start, new_end
+                bin.start,
+                bin.end,
+                new_start,
+                new_end
             );
         }
 
@@ -124,7 +224,8 @@ pub fn process_bin_with_readers(
             chrom,
             new_start,
             new_end,
-        )?;
+        )
+            .with_context(|| format!("failed expanded reference fetch for {}:{}-{}", chrom, new_start, new_end))?;
 
         if new_start < bin.start {
             let shift = (bin.start - new_start) as usize;
@@ -133,14 +234,15 @@ pub fn process_bin_with_readers(
             }
         }
 
-        let reads1 = fetch_reads_overlapping_with_reader(io, chrom, new_start, new_end)?;
-        sfx = SuffixWorkspace::build(&extended_ref);
+        let reads1 = fetch_reads_overlapping_with_reader(io, chrom, new_start, new_end)
+            .with_context(|| format!("failed expanded BAM fetch for {}:{}-{}", chrom, new_start, new_end))?;
 
         if debug_this_bin {
             log::warn!(
-                "[BIN] expanded ref_len={} reads={}",
+                "[BIN] expanded ref_len={} reads={} hotspots_preserved={}",
                 extended_ref.len(),
-                reads1.len()
+                reads1.len(),
+                hotspots.len()
             );
         }
 
@@ -149,7 +251,9 @@ pub fn process_bin_with_readers(
         (ref_window0, bin.start, reads0)
     };
 
-    // 4) confirm hotspots
+    let sfx = SuffixWorkspace::build(&final_ref_window);
+
+    // 5) Confirm hotspots
     let mut calls = Vec::new();
 
     for hs in &hotspots {
@@ -170,8 +274,10 @@ pub fn process_bin_with_readers(
         }
     }
 
+    let calls = dedup_calls(calls);
+
     if debug_this_bin {
-        log::warn!("[BIN] calls_written={}", calls.len());
+        log::warn!("[BIN] calls_after_dedup={}", calls.len());
     }
 
     Ok(calls)
