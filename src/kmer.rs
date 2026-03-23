@@ -3,7 +3,6 @@ use rust_htslib::bam;
 use rust_htslib::bam::record::Seq;
 use crate::hotspot::Hotspot;
 
-
 // Hotspot discovery is designed to be sensitive rather than final.
 // Candidate evidence is collected here and validated later in confirm.rs.
 pub struct MinimizerIndex {

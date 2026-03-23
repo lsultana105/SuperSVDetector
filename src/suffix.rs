@@ -11,7 +11,7 @@
 //! This means only ~18 string comparisons per query, which is negligible
 //! compared to the cost of I/O and alignment.
 //!
-//! ✅ In practice: using suffix arrays directly is simpler, avoids API churn in
+//! In practice: using suffix arrays directly is simpler, avoids API churn in
 //! rust-bio, and does not hurt performance for our bin-based design. FM-index
 //! would only offer meaningful gains if we searched across the entire genome
 //! at once (~3 Gb). Therefore, suffix array search is the pragmatic choice here.
