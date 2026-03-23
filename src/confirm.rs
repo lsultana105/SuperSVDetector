@@ -18,8 +18,6 @@ pub struct SvCall {
     pub len: isize,
     pub score: i32,
     pub reason: String,
-
-    // Minimal BND support (optional)
     pub mate_chrom: Option<String>,
     pub mate_pos: Option<u64>,
 }
@@ -62,7 +60,7 @@ fn trimmed_spread(sorted: &[u64], trim_frac: f64) -> u64 {
 }
 
 // ------------------------
-// PE deletion confirmer (the “good” one)
+// PE deletion confirmer
 // ------------------------
 
 fn confirm_pe_deletion_from_support(
@@ -75,27 +73,18 @@ fn confirm_pe_deletion_from_support(
     // Tunables
     const MIN_MAPQ: u8 = 20;
     const MIN_DEL_BP: u64 = 50;
-
-    // keep this at 4 for TBX sensitivity (you already moved toward this)
     const MIN_PE_SUPPORT: usize = 4;
-
-    // keep these aligned with discover_hotspots (you already did Z=3 there in TBX debug)
     const Z_CUTOFF: f64 = 3.0;
-
     const MAX_DEL_SPAN: u64 = 50_000;
-
     // robust gates
     const MAX_BP_SPREAD: u64 = 1500;
     const TRIM_FRAC: f64 = 0.10;
-
-    // NEW: breakpoint clustering window (handles bimodal mate starts)
     const CLUSTER_WIN_BP: u64 = 800;
 
     if insert_sd <= 0.0 {
         return None;
     }
 
-    // Two-pointer densest window on sorted positions (returns [lo, hi) indices)
     fn densest_window(sorted: &[u64], width: u64) -> (usize, usize) {
         if sorted.is_empty() {
             return (0, 0);
